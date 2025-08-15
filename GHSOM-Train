@@ -1,0 +1,2175 @@
+import numpy as np
+from scipy.spatial.distance import pdist, squareform
+
+
+
+class GHSOMTrain:
+    def __init__(
+        self,
+        data,
+        labels=None,
+        component_names=None,
+        scale_data=True,
+        initialization='randinit',
+        algorithm='batch',
+        breadth=0.3,
+        depth=0.1,
+        depth_dataitems=5,
+        mbreadth=5,
+        tracking=0,
+        qe_type='mean',
+        sub_layer_init='mirror',
+        sub_layer_trainlen=100,
+        sub_layer_radius=None,
+        sub_layer_neigh='gaussian',
+        grow_map_trainlen=50,
+        grow_map_radius=None,
+        grow_map_neigh='gaussian'
+    ):
+        """
+        Initialize the GHSOM trainer.
+
+        Parameters:
+        ----------
+        data : numpy.ndarray
+            Input data with shape (n_samples, n_features)
+        labels : list, optional
+            Labels for each data item
+        component_names : list, optional
+            Names of each feature component
+        scale_data : bool, default=True
+            Whether to scale data to [0, 1] range
+        initialization : str, default='randinit'
+            Method to initialize codebooks ('randinit', 'lininit', 'sample')
+        algorithm : str, default='batch'
+            Training algorithm ('batch' or 'sequential')
+        breadth : float, default=0.3
+            Breadth parameter controlling horizontal growth
+        depth : float, default=0.1
+            Depth parameter controlling vertical growth
+        depth_dataitems : int, default=5
+            Minimum number of data items for a unit to be expanded
+        mbreadth : int, default=5
+            Maximum number of horizontal growth iterations per layer
+        tracking : int, default=0
+            Level of training progress tracking (0=none, 1=minimal, 2=detailed)
+        qe_type : str, default='mean'
+            Type of quantization error ('mean' or 'sum')
+        sub_layer_init : str, default='mirror'
+            Initialization method for sub-layers
+        sub_layer_trainlen : int, default=100
+            Number of training iterations for sub-layers
+        sub_layer_radius : float, optional
+            Training radius for sub-layers (default=None which uses automatic calculation)
+        sub_layer_neigh : str, default='gaussian'
+            Neighborhood function for sub-layers ('gaussian', 'bubble', 'cutgauss', 'ep')
+        grow_map_trainlen : int, default=50
+            Number of training iterations after growing a map
+        grow_map_radius : float, optional
+            Training radius after growing a map
+        grow_map_neigh : str, default='gaussian'
+            Neighborhood function after growing a map
+        """
+        # Topology default
+        self.lattice = 'rect'
+        # Tracking flags
+        self._trained = False
+        self._printed_max_depth_once = False
+        self._printed_levels = set()
+        self._printed_depths = set()
+        self._processed_keys = set()
+        # Data storage
+        self.data = np.array(data)
+        self.dim = self.data.shape[1]
+        self.n_samples = self.data.shape[0]
+        self.labels = labels if labels is not None else ["" for _ in range(self.n_samples)]
+        # Scaling
+        self.normalize = scale_data
+        if scale_data:
+            self.min_vals = np.min(self.data, axis=0)
+            self.max_vals = np.max(self.data, axis=0)
+            self.data = (self.data - self.min_vals) / (self.max_vals - self.min_vals + 1e-8)
+        # Parameters
+        self.initialization = initialization
+        self.init_method = initialization
+        self.algorithm = algorithm
+        self.breadth = breadth
+        self.depth = depth
+        self.depth_dataitems = depth_dataitems
+        self.mbreadth = mbreadth
+        self.tracking = tracking
+        self.qe_type = qe_type
+        # Sub-layer params
+        self.sub_layer_init = sub_layer_init
+        self.sub_layer_trainlen = sub_layer_trainlen
+        self.sub_layer_radius = sub_layer_radius
+        self.sub_layer_neigh = sub_layer_neigh
+        # Grow-map params
+        self.grow_map_trainlen = grow_map_trainlen
+        self.grow_map_radius = grow_map_radius
+        self.grow_map_neigh = grow_map_neigh
+        # Initial train defaults
+        self.initial_trainlen = 100
+        self.initial_radius = None
+        self.initial_neigh = 'gaussian'
+    def train(self, data, labels=None, horizontal_grow=True, vertical_grow=True, max_depth=3):
+        """
+        Train the GHSOM with the given data.
+
+        Parameters:
+        ----------
+        data : numpy.ndarray
+            Training data matrix
+        labels : numpy.ndarray, optional
+            Labels for the data points
+        horizontal_grow : bool, default=True
+            Whether to allow horizontal growth (adding rows/columns)
+        vertical_grow : bool, default=True
+            Whether to allow vertical growth (adding new maps)
+        max_depth : int, default=3
+            Maximum depth allowed for vertical growth
+
+        Returns:
+        -------
+        ghsom : dict
+            Trained GHSOM structure with all submaps
+        """
+        # 🚫 Prevent redundant training
+        if hasattr(self, '_trained') and self._trained:
+            if self.tracking > 0:
+                print("⚠️ GHSOM already trained. Returning cached structure.")
+            return self._trained_structure
+
+        # Normalize data if required
+        if self.normalize:
+            data = (data - np.min(data, axis=0)) / (np.max(data, axis=0) - np.min(data, axis=0) + 1e-8)
+
+        # Initialize the root map
+        root_map = self._initialize_map((2, 2), data.shape[1])
+
+        # Train the root map
+        root_map = self._batch_train(root_map, data,
+                                     trainlen=self.initial_trainlen,
+                                     radius=self.initial_radius,
+                                     neigh=self.initial_neigh)
+
+        # Calculate the mean quantization error of the root map
+        _, qerrors = self._calculate_bmus_and_qerr(root_map['codebook'], data)
+        mqe0 = np.mean(qerrors)
+
+        if self.tracking > 0:
+            print(f"Root map trained. Mean QE: {mqe0:.6f}")
+
+        # Create the GHSOM structure
+        ghsom = {
+            'root_map': root_map,
+            'submaps': {},
+            'mqe0': mqe0,
+            'depth': self.depth,
+            'breadth': self.breadth,
+            'data': data,
+            'labels': labels
+        }
+
+        # Set maximum depth for hierarchical growth
+        self.max_depth = max_depth
+
+        # 🔁 Reset state for logging and tracking
+        self._printed_levels = set()
+        self._processed_keys = set()
+
+        # Grow the map hierarchically
+        if vertical_grow:
+            self._grow_hierarchically(ghsom, data, labels, level=0)
+            # ─── STAMP BMUs & LABELS ───────────────────────────────────
+            # 1) root-map
+        root = ghsom['root_map']
+        bmus_root, _ = self._calculate_bmus_and_qerr(root['codebook'], data)
+        root['bmus'] = bmus_root
+        root['labels'] = labels.tolist() if labels is not None else []
+
+        # 2) second-layer submaps
+        for unit_idx, info in ghsom['submaps'].items():
+            child_map = info['map']
+            idxs = info['data_indices']
+            sub_data = data[idxs]
+            sub_lbls = labels[idxs].tolist() if labels is not None else []
+            bmus_sub, _ = self._calculate_bmus_and_qerr(child_map['codebook'], sub_data)
+            info['bmus'] = bmus_sub
+            info['labels'] = sub_lbls
+
+        # Cache result and mark training complete
+        self._trained_structure = ghsom
+        self._trained = True
+
+        # Return the trained GHSOM
+        return ghsom
+
+    def _grow_hierarchically(self, ghsom, data, labels=None, parent_idx=None, level=0):
+        # ✅ Unique key to prevent duplicate processing
+        map_key = f"root_{level}" if parent_idx is None else f"{parent_idx}_{level}"
+        if map_key in self._processed_keys:
+            return ghsom
+        self._processed_keys.add(map_key)
+
+        # At max depth? Log only once per level
+        if level >= self.max_depth:
+            if self.tracking > 0 and not hasattr(self, "_printed_depths"):
+                self._printed_depths = set()
+
+            if self.tracking > 0 and level not in self._printed_depths:
+                print(f"⛔ Max depth {self.max_depth} reached at depth {level}")
+                self._printed_depths.add(level)
+            return ghsom
+
+        # === ROOT LEVEL ===
+        if level == 0:
+            root_map = ghsom['root_map']
+            mqe0 = ghsom['mqe0']
+            bmus, qerrors = self._calculate_bmus_and_qerr(root_map['codebook'], data)
+
+            unit_qe = np.zeros(root_map['codebook'].shape[0])
+            unit_counts = np.zeros(root_map['codebook'].shape[0], dtype=int)
+            for i, bmu in enumerate(bmus):
+                unit_qe[bmu] += qerrors[i]
+                unit_counts[bmu] += 1
+            for i in range(len(unit_qe)):
+                if unit_counts[i] > 0:
+                    unit_qe[i] /= unit_counts[i]
+
+            for unit_idx in range(root_map['codebook'].shape[0]):
+                if level + 1 >= self.max_depth:
+                    continue  # ⛔ Prevent growing beyond max depth
+
+                threshold = mqe0 * self.depth
+                if unit_counts[unit_idx] > 0 and unit_qe[unit_idx] > threshold + 1e-8:
+                    if self.tracking > 0:
+                        print(
+                            f"📈 Growing submap for root unit {unit_idx}, QE: {unit_qe[unit_idx]:.6f} > threshold {threshold:.6f}")
+
+                    unit_data_indices = np.where(bmus == unit_idx)[0]
+                    unit_data = data[unit_data_indices]
+                    unit_labels = labels[unit_data_indices] if labels is not None else None
+
+                    submap = self._initialize_map((2, 2), data.shape[1])
+                    submap = self._batch_train(submap, unit_data, self.initial_trainlen, self.initial_radius,
+                                               self.initial_neigh)
+
+                    growing = True
+                    while growing:
+                        bmus, qerrors = self._calculate_bmus_and_qerr(submap['codebook'], unit_data)
+                        sub_qe = np.zeros(submap['codebook'].shape[0])
+                        sub_counts = np.zeros(submap['codebook'].shape[0], dtype=int)
+                        for i, bmu in enumerate(bmus):
+                            sub_qe[bmu] += qerrors[i]
+                            sub_counts[bmu] += 1
+                        for i in range(len(sub_qe)):
+                            if sub_counts[i] > 0:
+                                sub_qe[i] /= sub_counts[i]
+                        submap, grew = self._grow_map(submap, unit_data, sub_qe, mqe0)
+                        if grew:
+                            submap = self._batch_train(
+                                submap,
+                                unit_data,
+                                trainlen=self.grow_map_trainlen,
+                                radius=self.grow_map_radius,
+                                neigh=self.grow_map_neigh
+                            )
+                        else:
+                            growing = False
+
+                    ghsom['submaps'][unit_idx] = {
+                        'map': submap,
+                        'data_indices': unit_data_indices,
+                        'parent_unit': unit_idx,
+                        'level': level + 1,
+                        'submaps': {}
+                    }
+
+                    self._grow_hierarchically(ghsom, unit_data, unit_labels, unit_idx, level + 1)
+
+        # === SUBMAP LEVEL ===
+        else:
+            parent_map = ghsom['submaps'][parent_idx]
+            submap = parent_map['map']
+            mqe0 = ghsom['mqe0']
+            bmus, qerrors = self._calculate_bmus_and_qerr(submap['codebook'], data)
+
+            unit_qe = np.zeros(submap['codebook'].shape[0])
+            unit_counts = np.zeros(submap['codebook'].shape[0], dtype=int)
+            for i, bmu in enumerate(bmus):
+                unit_qe[bmu] += qerrors[i]
+                unit_counts[bmu] += 1
+            for i in range(len(unit_qe)):
+                if unit_counts[i] > 0:
+                    unit_qe[i] /= unit_counts[i]
+
+            for unit_idx in range(submap['codebook'].shape[0]):
+                if level + 1 >= self.max_depth:
+                    continue  # ⛔ Prevent growing beyond max depth
+
+                threshold = mqe0 * self.depth
+                if unit_counts[unit_idx] > 0 \
+                        and unit_qe[unit_idx] > threshold + 1e-8 \
+                        and unit_counts[unit_idx] >= self.depth_dataitems:
+                    if self.tracking > 0:
+                        print(
+                            f"📈 Growing submap for unit {unit_idx} at level {level + 1}, QE: {unit_qe[unit_idx]:.6f} > threshold {threshold:.6f}")
+
+                    unit_data_indices = np.where(bmus == unit_idx)[0]
+                    unit_data = data[unit_data_indices]
+                    unit_labels = labels[unit_data_indices] if labels is not None else None
+
+                    child_map = self._initialize_map((2, 2), data.shape[1])
+                    child_map = self._batch_train(child_map, unit_data, self.initial_trainlen, self.initial_radius,
+                                                  self.initial_neigh)
+
+                    growing = True
+                    while growing:
+                        child_bmus, child_qerrors = self._calculate_bmus_and_qerr(child_map['codebook'], unit_data)
+                        child_qe = np.zeros(child_map['codebook'].shape[0])
+                        child_counts = np.zeros(child_map['codebook'].shape[0], dtype=int)
+                        for i, bmu in enumerate(child_bmus):
+                            child_qe[bmu] += child_qerrors[i]
+                            child_counts[bmu] += 1
+                        for i in range(len(child_qe)):
+                            if child_counts[i] > 0:
+                                child_qe[i] /= child_counts[i]
+                        child_map, grew = self._grow_map(child_map, unit_data, child_qe, mqe0)
+                        if grew:
+                            child_map = self._batch_train(child_map, unit_data, self.grow_trainlen, self.grow_radius,
+                                                          self.grow_neigh)
+                        else:
+                            growing = False
+
+                    submap_id = f"{parent_idx}_{unit_idx}"
+                    ghsom['submaps'][submap_id] = {
+                        'map': child_map,
+                        'data_indices': unit_data_indices,
+                        'parent_unit': unit_idx,
+                        'parent_map': parent_idx,
+                        'level': level + 1,
+                        'submaps': {}
+                    }
+
+                    self._grow_hierarchically(ghsom, unit_data, unit_labels, submap_id, level + 1)
+
+        return ghsom
+
+    def _initialize_map(self, msize, dim):
+        """
+        Initialize a map with the given size and dimension.
+        """
+        map_struct = {}
+        map_struct['topol'] = {
+            'msize': msize,
+            'lattice': self.lattice
+        }
+
+        n_units = msize[0] * msize[1]
+        method = self.init_method.lower()
+        if method in ('randinit', 'random'):
+            codebook = self._randinit(self.data, msize)
+        elif method in ('lininit', 'linear'):
+            codebook = self._lininit(self.data, msize)
+        elif method == 'sample':
+            codebook = self._sample_init(self.data, msize)
+        else:
+            codebook = np.random.rand(n_units, dim)
+
+        map_struct['codebook'] = codebook
+        return map_struct
+
+    def _finalize_ghsom(self, ghsom):
+        """
+        Finalize the GHSOM by finding the final mapping for each data item.
+
+        Parameters:
+        ----------
+        ghsom : dict
+            GHSOM structure to finalize
+        """
+        final_units = [-1] * self.n_samples
+        final_maps = [-1] * self.n_samples
+
+        # Process each map in reverse order (deepest maps first)
+        for map_idx in range(len(ghsom['sMap']) - 1, -1, -1):
+            data_indices = ghsom['dataitems'][map_idx]
+            sMap = ghsom['sMap'][map_idx]
+
+            # Check which data items haven't been assigned yet
+            unassigned = np.array([i for i in data_indices if final_maps[i] == -1])
+
+            if len(unassigned) > 0:
+                # Find BMUs for these data items
+                data = self.data[unassigned]
+                bmus, _ = self._calculate_bmus_and_qerr(sMap['codebook'], data)
+
+                # Assign final units and maps
+                for i, idx in enumerate(unassigned):
+                    final_units[idx] = bmus[i]
+                    final_maps[idx] = map_idx
+
+        ghsom['final_units'] = final_units
+        ghsom['final_maps'] = final_maps
+
+    def _train_first_map(self):
+        """
+        Train the first map (layer 0) of the GHSOM.
+
+        Returns:
+        -------
+        map_struct : dict
+            Trained first map
+        """
+        # Create initial map (2x2)
+        msize = [2, 2]
+
+        # Initialize the map based on the chosen method
+        if self.initialization == 'randinit':
+            codebook = self._randinit(self.data, msize)
+        elif self.initialization == 'lininit':
+            codebook = self._lininit(self.data, msize)
+        elif self.initialization == 'sample':
+            codebook = self._sample_init(self.data, msize)
+        else:
+            raise ValueError(f"Unknown initialization method: {self.initialization}")
+
+        # Create map structure
+        map_struct = {
+            'codebook': codebook,
+            'topol': {
+                'msize': msize,
+                'lattice': 'rect',
+                'shape': 'sheet'
+            },
+            'labels': []
+        }
+
+        # Train the map
+        if self.algorithm == 'batch':
+            map_struct = self._batch_train(map_struct, self.data,
+                                           trainlen=100,  # Default training length
+                                           radius=None,  # Will be calculated automatically
+                                           neigh='gaussian')
+        else:  # Sequential algorithm
+            map_struct = self._sequential_train(map_struct, self.data,
+                                                trainlen=100,  # Default training length
+                                                radius=None,  # Will be calculated automatically
+                                                neigh='gaussian')
+
+        # Grow the map horizontally until it satisfies the breadth criterion
+        data_variance = np.var(self.data, axis=0).sum()
+        map_struct = self._grow_map(map_struct, self.data, None, data_variance)
+
+        return map_struct
+
+    def _lininit(self, data, msize):
+        """
+        Linear initialization of map codebook.
+
+        Linear initialization initializes the map nodes by placing them to the same subspace as
+        the input space, with even intervals between the nodes so that the whole map spans
+        approximately the same area as the input data.
+
+        Parameters:
+        ----------
+        data : numpy.ndarray
+            Training data, shape [n_samples, dim]
+        msize : list
+            Map size [height, width]
+
+        Returns:
+        -------
+        codebook : numpy.ndarray
+            Initialized codebook, shape [n_units, dim]
+        """
+        # Get the dimensions of the data
+        dlen, dim = data.shape
+
+        # Number of map units
+        munits = msize[0] * msize[1]
+
+        # Calculate mean and standard deviation of the data
+        data_mean = np.mean(data, axis=0)
+        data_std = np.std(data, axis=0)
+
+        # Find the two principal eigenvectors of the data
+        # This is used to orient the map according to the main variance directions
+        if dim > 1:
+            # Calculate covariance matrix
+            cov_matrix = np.cov(data, rowvar=False)
+
+            # Get eigenvalues and eigenvectors
+            eigvals, eigvecs = np.linalg.eig(cov_matrix)
+
+            # Sort eigenvalues and corresponding eigenvectors in descending order
+            idx = eigvals.argsort()[::-1]
+            eigvals = eigvals[idx]
+            eigvecs = eigvecs[:, idx]
+
+            # Use the two principal eigenvectors
+            pc1 = eigvecs[:, 0]
+            pc2 = eigvecs[:, 1] if dim > 1 else np.zeros_like(pc1)
+
+            # Scale eigenvectors by the square root of their eigenvalues
+            pc1 = pc1 * np.sqrt(eigvals[0])
+            pc2 = pc2 * np.sqrt(eigvals[1]) if dim > 1 else np.zeros_like(pc1)
+        else:
+            # For 1D data, just use the standard deviation
+            pc1 = np.array([data_std[0]])
+            pc2 = np.array([0])
+
+        # Create a grid of map units with coordinates [0,1]
+        grid_x = np.linspace(0, 1, msize[1])
+        grid_y = np.linspace(0, 1, msize[0])
+
+        # Initialize codebook
+        codebook = np.zeros((munits, dim))
+
+        # Fill the codebook based on grid coordinates
+        i = 0
+        for y in grid_y:
+            for x in grid_x:
+                # Map [0,1] coordinates to the data space
+                # Scale by eigenvectors and add the mean
+                codebook[i] = data_mean + (x - 0.5) * pc1 + (y - 0.5) * pc2
+                i += 1
+
+        return codebook
+
+    def _randinit(self, data, msize):
+        """
+        Random initialization of map codebook.
+
+        Parameters:
+        ----------
+        data : numpy.ndarray
+            Training data, shape [n_samples, dim]
+        msize : list
+            Map size [height, width]
+
+        Returns:
+        -------
+        codebook : numpy.ndarray
+            Initialized codebook, shape [n_units, dim]
+        """
+        # Get the dimensions of the data
+        dlen, dim = data.shape
+
+        # Number of map units
+        munits = msize[0] * msize[1]
+
+        # Calculate min and max values for each dimension
+        data_min = np.min(data, axis=0)
+        data_max = np.max(data, axis=0)
+        data_range = data_max - data_min
+
+        # Initialize codebook with random values in the same range as the data
+        codebook = np.random.random((munits, dim)) * data_range + data_min
+
+        return codebook
+
+    def _sample_init(self, data, msize):
+        """
+        Initialize map codebook by sampling from training data.
+
+        Parameters:
+        ----------
+        data : numpy.ndarray
+            Training data, shape [n_samples, dim]
+        msize : list
+            Map size [height, width]
+
+        Returns:
+        -------
+        codebook : numpy.ndarray
+            Initialized codebook, shape [n_units, dim]
+        """
+        # Get the dimensions of the data
+        dlen, dim = data.shape
+
+        # Number of map units
+        munits = msize[0] * msize[1]
+
+        # Randomly select indices from the data
+        if dlen >= munits:
+            indices = np.random.choice(dlen, munits, replace=False)
+        else:
+            # If fewer data samples than map units, some samples will be repeated
+            indices = np.random.choice(dlen, munits, replace=True)
+
+        # Initialize codebook with selected data samples
+        codebook = data[indices].copy()
+
+        return codebook
+
+    def _find_expand_units(self, sMap, dataitems):
+        """
+        Find map units that need to be expanded with a sub-map.
+
+        Parameters:
+        ----------
+        sMap : dict
+            Map structure containing codebook and topology
+        dataitems : numpy.ndarray
+            Indices of data items mapped to this map
+
+        Returns:
+        -------
+        expand_units : numpy.ndarray
+            Indices of units that need to be expanded
+        expand_units_qe : numpy.ndarray
+            Quantization errors of these units
+        """
+        data = self.data[dataitems]
+        codebook = sMap['codebook']
+
+        # Find BMUs and quantization errors for data
+        bmus, qerr = self._calculate_bmus_and_qerr(codebook, data)
+
+        munits = codebook.shape[0]
+        unit_qerr = np.zeros(munits)
+        unit_mapped = np.zeros(munits)
+
+        # Calculate quantization error and count samples for each unit
+        for i in range(munits):
+            mask = (bmus == i)
+            unit_mapped[i] = np.sum(mask)
+            unit_qerr[i] = np.sum(qerr[mask])
+
+        # Calculate mean QE if needed
+        if self.qe_type == 'mean':
+            idx = unit_mapped > 0
+            unit_qerr[idx] /= unit_mapped[idx]
+
+        # Find units to expand based on QE threshold and minimum number of data items
+        expand_mask = (unit_qerr > self.depth * np.sum(unit_qerr)) & (unit_mapped >= self.depth_dataitems)
+        expand_units = np.where(expand_mask)[0]
+        expand_units_qe = unit_qerr[expand_mask]
+
+        return expand_units, expand_units_qe
+
+    def _create_sub_map(self, ghsom, parent_idx, unit_idx, qe):
+        """
+        Create a new sub-map for a specific unit.
+
+        Parameters:
+        ----------
+        ghsom : dict
+            GHSOM map structure
+        parent_idx : int
+            Index of the parent map
+        unit_idx : int
+            Index of the unit to expand
+        qe : float
+            Quantization error of the unit
+
+        Returns:
+        -------
+        map_struct : dict
+            The new map structure
+        """
+        parent_map = ghsom['sMap'][parent_idx]
+        parent_msize = parent_map['topol']['msize']
+
+        # Get data items that map to this unit
+        parent_data_indices = ghsom['dataitems'][parent_idx]
+        data = self.data[parent_data_indices]
+
+        # Find BMUs to get the data items for the sub-map
+        bmus, _ = self._calculate_bmus_and_qerr(parent_map['codebook'], data)
+        sub_data_indices = np.where(bmus == unit_idx)[0]
+        sub_data = data[sub_data_indices]
+
+        # Create initial map (2x2)
+        msize = [2, 2]
+
+        # Initialize the sub-map based on the chosen initialization method
+        if self.sub_layer_init == 'mirror':
+            codebook = self._mirror_init(parent_map['codebook'], unit_idx, parent_msize, msize)
+        elif self.sub_layer_init == 'dittenbach':
+            codebook = self._dittenbach_init(parent_map['codebook'], unit_idx, parent_msize, msize)
+        elif self.sub_layer_init == 'sample':
+            codebook = self._sample_init(sub_data, msize)
+        elif self.sub_layer_init == 'randinit':
+            codebook = self._randinit(sub_data, msize)
+        elif self.sub_layer_init == 'lininit':
+            codebook = self._lininit(sub_data, msize)
+        else:
+            raise ValueError(f"Unsupported initialization method for sub-layer: {self.sub_layer_init}")
+
+        # Create map structure
+        map_struct = {
+            'codebook': codebook,
+            'topol': {
+                'msize': msize,
+                'lattice': 'rect',
+                'shape': 'sheet'
+            },
+            'labels': []
+        }
+
+        # Train the sub-map
+        if self.algorithm == 'batch':
+            map_struct = self._batch_train(map_struct, sub_data,
+                                           trainlen=self.sub_layer_trainlen,
+                                           radius=self.sub_layer_radius,
+                                           neigh=self.sub_layer_neigh)
+        else:  # Sequential algorithm
+            map_struct = self._sequential_train(map_struct, sub_data,
+                                                trainlen=self.sub_layer_trainlen,
+                                                radius=self.sub_layer_radius,
+                                                neigh=self.sub_layer_neigh)
+
+        # Grow the map horizontally until it satisfies the breadth criterion
+        map_struct = self._grow_map(map_struct, sub_data, qe, self.depth)
+
+        return map_struct
+
+    def _mirror_init(self, parent_codebook, unit_idx, parent_msize, msize):
+        """
+        Initialize a sub-map using mirror initialization.
+
+        The mirror initialization uses the parent unit and its neighbors to create
+        an initial sub-map that represents the local data space.
+
+        Parameters:
+        ----------
+        parent_codebook : numpy.ndarray
+            Codebook of the parent map
+        unit_idx : int
+            Index of the unit to expand
+        parent_msize : list
+            Size of the parent map [height, width]
+        msize : list
+            Size of the sub-map [height, width]
+
+        Returns:
+        -------
+        codebook : numpy.ndarray
+            Initialized codebook for the sub-map
+        """
+        dim = parent_codebook.shape[1]
+        n_units = msize[0] * msize[1]
+
+        # Get the parent unit vector
+        parent_unit = parent_codebook[unit_idx].copy()
+
+        # Get the parent unit coordinates in the grid
+        parent_coords = self._unit_idx_to_coords(unit_idx, parent_msize)
+
+        # Get neighbor indices
+        neighbors = []
+        for dy in [-1, 0, 1]:
+            for dx in [-1, 0, 1]:
+                if dy == 0 and dx == 0:
+                    continue  # Skip the unit itself
+
+                # Calculate neighbor coordinates
+                ny = parent_coords[0] + dy
+                nx = parent_coords[1] + dx
+
+                # Check if neighbor is within the map
+                if 0 <= ny < parent_msize[0] and 0 <= nx < parent_msize[1]:
+                    neighbor_idx = ny * parent_msize[1] + nx
+                    neighbors.append(neighbor_idx)
+
+        # Initialize codebook
+        codebook = np.zeros((n_units, dim))
+
+        # Set center unit (of the 2x2 map) to the parent unit
+        codebook[0] = parent_unit
+
+        # Set other units based on the difference between the parent unit and its neighbors
+        diff_vectors = []
+        for i, neighbor_idx in enumerate(neighbors[:n_units - 1]):  # Only use as many neighbors as needed
+            diff_vectors.append(parent_codebook[neighbor_idx] - parent_unit)
+
+        # If there are not enough neighbors, add random small differences
+        while len(diff_vectors) < n_units - 1:
+            diff_vectors.append(np.random.randn(dim) * 0.1)
+
+        # Set the remaining units using the difference vectors
+        for i in range(1, n_units):
+            codebook[i] = parent_unit + diff_vectors[i - 1] * 0.5
+
+        return codebook
+
+    def _dittenbach_init(self, parent_codebook, unit_idx, parent_msize, msize):
+        """
+        Initialize a sub-map using Dittenbach's method.
+
+        Parameters:
+        ----------
+        parent_codebook : numpy.ndarray
+            Codebook of the parent map
+        unit_idx : int
+            Index of the unit to expand
+        parent_msize : list
+            Size of the parent map [height, width]
+        msize : list
+            Size of the sub-map [height, width]
+
+        Returns:
+        -------
+        codebook : numpy.ndarray
+            Initialized codebook for the sub-map
+        """
+        dim = parent_codebook.shape[1]
+        n_units = msize[0] * msize[1]
+
+        # Get the parent unit vector
+        parent_unit = parent_codebook[unit_idx].copy()
+
+        # Initialize codebook with small random variations of the parent unit
+        codebook = np.tile(parent_unit, (n_units, 1))
+        codebook += np.random.randn(n_units, dim) * 0.01
+
+        return codebook
+
+    def _grow_map(self, sMap, data, qe, mqe0):
+        """
+        Grow map by adding rows or columns to reduce quantization error.
+
+        Parameters:
+        ----------
+        sMap : dict
+            Map structure to grow
+        data : numpy.ndarray
+            Training data
+        qe : numpy.ndarray
+            Quantization error for each unit
+        mqe0 : float
+            Mean quantization error threshold for growth
+
+        Returns:
+        -------
+        sMap : dict
+            Grown map structure
+        grew : bool
+            Whether the map was grown
+        """
+        codebook = sMap['codebook']
+        msize = sMap['topol']['msize']
+        lattice = sMap['topol']['lattice']
+
+        # Get current map dimensions
+        n_rows, n_cols = msize
+        n_units = codebook.shape[0]
+        n_dim = codebook.shape[1]
+
+        # Get BMUs for all data points
+        bmus, _ = self._calculate_bmus_and_qerr(codebook, data)
+
+        # Count data points mapped to each unit
+        unit_counts = np.zeros(n_units, dtype=int)
+        for bmu in bmus:
+            unit_counts[bmu] += 1
+
+        # Find unit with highest quantization error
+        error_unit = np.argmax(qe)
+
+        # If error is below threshold, no need to grow
+        if qe[error_unit] <= mqe0 * self.breadth:
+            if self.tracking > 1:
+                print(f"No growth needed. Max QE {qe[error_unit]:.6f} <= threshold {mqe0 * self.breadth:.6f}")
+            return sMap, False
+
+        # Determine the growth direction (row or column)
+        # Convert unit index to 2D coordinates
+        error_row = error_unit // n_cols
+        error_col = error_unit % n_cols
+
+        # Find the most dissimilar neighbor to determine growth direction
+        neighbors = []
+
+        # Check row neighbors
+        if error_row > 0:  # Has upper neighbor
+            upper_idx = (error_row - 1) * n_cols + error_col
+            neighbors.append((upper_idx, 'row', -1))
+        if error_row < n_rows - 1:  # Has lower neighbor
+            lower_idx = (error_row + 1) * n_cols + error_col
+            neighbors.append((lower_idx, 'row', 1))
+
+        # Check column neighbors
+        if error_col > 0:  # Has left neighbor
+            left_idx = error_row * n_cols + (error_col - 1)
+            neighbors.append((left_idx, 'col', -1))
+        if error_col < n_cols - 1:  # Has right neighbor
+            right_idx = error_row * n_cols + (error_col + 1)
+            neighbors.append((right_idx, 'col', 1))
+
+        # For hexagonal lattice, add diagonal neighbors if needed
+        if lattice == 'hexa':
+            # Add additional hexagonal neighbors based on odd/even row
+            pass  # Implement if needed
+
+        # Calculate dissimilarity with neighbors
+        max_dissimilarity = -1
+        growth_direction = None
+        growth_neighbor = None
+        growth_position = None
+
+        for neighbor_idx, direction, position in neighbors:
+            dissimilarity = np.linalg.norm(codebook[error_unit] - codebook[neighbor_idx])
+            if dissimilarity > max_dissimilarity:
+                max_dissimilarity = dissimilarity
+                growth_direction = direction
+                growth_neighbor = neighbor_idx
+                growth_position = position
+
+        # Create new codebook with added row or column
+        if growth_direction == 'row':
+            # Add a new row
+            new_row_idx = error_row + (0 if growth_position < 0 else 1)
+            new_msize = (n_rows + 1, n_cols)
+            new_n_units = new_msize[0] * new_msize[1]
+            new_codebook = np.zeros((new_n_units, n_dim))
+
+            # Fill the new codebook
+            for i in range(new_msize[0]):
+                for j in range(new_msize[1]):
+                    new_idx = i * new_msize[1] + j
+
+                    if i < new_row_idx:
+                        # Copy original units before the new row
+                        old_idx = i * n_cols + j
+                        new_codebook[new_idx] = codebook[old_idx]
+                    elif i > new_row_idx:
+                        # Copy original units after the new row
+                        old_idx = (i - 1) * n_cols + j
+                        new_codebook[new_idx] = codebook[old_idx]
+                    else:
+                        # Interpolate for the new row
+                        if new_row_idx == 0:
+                            # New row at the top, interpolate with the row below
+                            below_idx = j
+                            new_codebook[new_idx] = codebook[below_idx] * 0.95
+                        elif new_row_idx == new_msize[0] - 1:
+                            # New row at the bottom, interpolate with the row above
+                            above_idx = (new_row_idx - 1) * n_cols + j
+                            new_codebook[new_idx] = codebook[above_idx] * 0.95
+                        else:
+                            # New row in the middle, interpolate with rows above and below
+                            above_idx = (new_row_idx - 1) * n_cols + j
+                            below_idx = (new_row_idx) * n_cols + j
+                            new_codebook[new_idx] = (codebook[above_idx] + codebook[below_idx]) / 2
+
+            growth_info = f"row at position {new_row_idx}"
+
+        else:  # growth_direction == 'col'
+            # Add a new column
+            new_col_idx = error_col + (0 if growth_position < 0 else 1)
+            new_msize = (n_rows, n_cols + 1)
+            new_n_units = new_msize[0] * new_msize[1]
+            new_codebook = np.zeros((new_n_units, n_dim))
+
+            # Fill the new codebook
+            for i in range(new_msize[0]):
+                for j in range(new_msize[1]):
+                    new_idx = i * new_msize[1] + j
+
+                    if j < new_col_idx:
+                        # Copy original units before the new column
+                        old_idx = i * n_cols + j
+                        new_codebook[new_idx] = codebook[old_idx]
+                    elif j > new_col_idx:
+                        # Copy original units after the new column
+                        old_idx = i * n_cols + (j - 1)
+                        new_codebook[new_idx] = codebook[old_idx]
+                    else:
+                        # Interpolate for the new column
+                        if new_col_idx == 0:
+                            # New column at the left, interpolate with the column to the right
+                            right_idx = i * n_cols
+                            new_codebook[new_idx] = codebook[right_idx] * 0.95
+                        elif new_col_idx == new_msize[1] - 1:
+                            # New column at the right, interpolate with the column to the left
+                            left_idx = i * n_cols + (n_cols - 1)
+                            new_codebook[new_idx] = codebook[left_idx] * 0.95
+                        else:
+                            # New column in the middle, interpolate with columns to the left and right
+                            left_idx = i * n_cols + (new_col_idx - 1)
+                            right_idx = i * n_cols + new_col_idx
+                            new_codebook[new_idx] = (codebook[left_idx] + codebook[right_idx]) / 2
+
+            growth_info = f"column at position {new_col_idx}"
+
+        # Update the map structure
+        sMap['codebook'] = new_codebook
+        sMap['topol']['msize'] = new_msize
+
+        if self.tracking > 1:
+            print(f"Map grown: added {growth_info}. New dimensions: {new_msize[0]}x{new_msize[1]}")
+
+        return sMap, True
+
+    def _unit_idx_to_coords(self, idx, msize):
+        """
+        Convert unit index to grid coordinates.
+
+        Parameters:
+        ----------
+        idx : int
+            Unit index
+        msize : list
+            Map size [height, width]
+
+        Returns:
+        -------
+        coords : tuple
+            (row, column) coordinates
+        """
+        row = idx // msize[1]
+        col = idx % msize[1]
+        return (row, col)
+
+    def _calculate_bmus_and_qerr(self, codebook, data):
+        """
+        Calculate Best Matching Units (BMUs) and quantization errors for data points.
+
+        Parameters:
+        ----------
+        codebook : numpy.ndarray
+            Codebook matrix with shape (n_units, n_features)
+        data : numpy.ndarray
+            Data matrix with shape (n_samples, n_features)
+
+        Returns:
+        -------
+        bmus : numpy.ndarray
+            Array of BMU indices for each data point
+        qerrors : numpy.ndarray
+            Array of quantization errors for each data point
+        """
+        n_samples = data.shape[0]
+        n_units = codebook.shape[0]
+
+        # Initialize arrays for BMUs and quantization errors
+        bmus = np.zeros(n_samples, dtype=int)
+        qerrors = np.zeros(n_samples)
+
+        # For each data point, find the BMU
+        for i in range(n_samples):
+            # Calculate Euclidean distances between data point and all codebook vectors
+            distances = np.sum((codebook - data[i, :]) ** 2, axis=1)
+
+            # Find the closest unit (BMU)
+            bmu_idx = np.argmin(distances)
+
+            # Store BMU index and quantization error
+            bmus[i] = bmu_idx
+            qerrors[i] = np.sqrt(distances[bmu_idx])  # Euclidean distance
+
+        return bmus, qerrors
+
+    def _neighborhood_function(self, distances, radius, neighborhood_type='gaussian'):
+        """
+        Calculate neighborhood function values for given distances and radius.
+
+        Parameters:
+        ----------
+        distances : numpy.ndarray
+            Distances between map units, shape [n_units]
+        radius : float
+            Neighborhood radius
+        neighborhood_type : str
+            Type of neighborhood function: 'gaussian', 'bubble', 'cutgauss', or 'ep'
+
+        Returns:
+        -------
+        h : numpy.ndarray
+            Neighborhood function values, shape [n_units]
+        """
+        if neighborhood_type == 'gaussian':
+            return self._gaussian(distances, radius)
+        elif neighborhood_type == 'bubble':
+            return self._bubble(distances, radius)
+        elif neighborhood_type == 'cutgauss':
+            return self._cutgauss(distances, radius)
+        elif neighborhood_type == 'ep':
+            return self._ep(distances, radius)
+        else:
+            raise ValueError(f"Unsupported neighborhood function: {neighborhood_type}")
+
+    def _gaussian(self, distances, radius):
+        """
+        Gaussian neighborhood function.
+
+        Parameters:
+        ----------
+        distances : numpy.ndarray
+            Distances between map units, shape [n_units]
+        radius : float
+            Neighborhood radius
+
+        Returns:
+        -------
+        h : numpy.ndarray
+            Neighborhood function values, shape [n_units]
+        """
+        return np.exp(-(distances ** 2) / (2 * radius ** 2))
+
+    def _bubble(self, distances, radius):
+        """
+        Bubble (step) neighborhood function.
+
+        Parameters:
+        ----------
+        distances : numpy.ndarray
+            Distances between map units, shape [n_units]
+        radius : float
+            Neighborhood radius
+
+        Returns:
+        -------
+        h : numpy.ndarray
+            Neighborhood function values, shape [n_units]
+        """
+        return (distances <= radius).astype(float)
+
+    def _cutgauss(self, distances, radius):
+        """
+        Cut Gaussian neighborhood function.
+        Same as Gaussian but values below 0.01 are set to 0.
+
+        Parameters:
+        ----------
+        distances : numpy.ndarray
+            Distances between map units, shape [n_units]
+        radius : float
+            Neighborhood radius
+
+        Returns:
+        -------
+        h : numpy.ndarray
+            Neighborhood function values, shape [n_units]
+        """
+        h = np.exp(-(distances ** 2) / (2 * radius ** 2))
+        h[h < 0.01] = 0
+        return h
+
+    def _ep(self, distances, radius):
+        """
+        EP (Epanechicov) neighborhood function.
+        h = max(0, 1 - (d/r)²)
+
+        Parameters:
+        ----------
+        distances : numpy.ndarray
+            Distances between map units, shape [n_units]
+        radius : float
+            Neighborhood radius
+
+        Returns:
+        -------
+        h : numpy.ndarray
+            Neighborhood function values, shape [n_units]
+        """
+        if radius == 0:
+            h = np.zeros_like(distances)
+            h[distances == 0] = 1
+            return h
+
+        h = 1 - (distances / radius) ** 2
+        h[h < 0] = 0
+        return h
+
+    def _calculate_map_distances(self, msize):
+        """
+        Calculate distances between all units in a map.
+
+        Parameters:
+        ----------
+        msize : list
+            Map size [height, width]
+
+        Returns:
+        -------
+        unit_distances : numpy.ndarray
+            Matrix of distances between map units, shape [n_units, n_units]
+        """
+        # Get all unit coordinates
+        coords = self._get_unit_coords(msize[0], msize[1])
+
+        # Calculate Euclidean distances between all pairs of coordinates
+        n_units = msize[0] * msize[1]
+        unit_distances = np.zeros((n_units, n_units))
+
+        for i in range(n_units):
+            for j in range(n_units):
+                unit_distances[i, j] = np.sqrt(np.sum((coords[i] - coords[j]) ** 2))
+
+        return unit_distances
+
+    def _batch_train(self, sMap, data, trainlen=None, radius=None, neigh=None):
+        """
+        Train a Self-Organizing Map using the batch algorithm.
+
+        Parameters:
+        ----------
+        sMap : dict
+            Map structure to train
+        data : numpy.ndarray
+            Training data
+        trainlen : int, optional
+            Number of training iterations
+        radius : float, optional
+            Initial neighborhood radius
+        neigh : str, optional
+            Neighborhood function (e.g., 'gaussian', 'bubble')
+
+        Returns:
+        -------
+        sMap : dict
+            The trained map structure
+        """
+        # Set default parameters if not provided
+        if trainlen is None:
+            trainlen = self.initial_trainlen
+        if neigh is None:
+            neigh = self.initial_neigh
+
+        # Get map dimensions
+        msize = sMap['topol']['msize']
+        n_units = msize[0] * msize[1]
+
+        # Calculate initial radius if not provided
+        if radius is None:
+            # Default radius calculation based on map dimensions
+            radius = max(msize[0], msize[1]) / 2
+
+        # Get the grid coordinates for each unit
+        grid_coords = self._get_grid_coords(msize)
+
+        if self.tracking > 0:
+            print(f"Batch training map size {msize} with {n_units} units for {trainlen} iterations")
+
+        # Calculate initial and final radius
+        initial_radius = radius
+        final_radius = 0.5
+
+        # Calculate radius decay factor
+        radius_decay = np.exp(np.log(final_radius / initial_radius) / trainlen)
+
+        # Start training
+        curr_radius = initial_radius
+
+        for t in range(trainlen):
+            # Calculate current radius
+            curr_radius = initial_radius * (radius_decay ** t)
+
+            # Calculate neighborhood matrix
+            h = self._calculate_neighborhood(grid_coords, curr_radius, neigh)
+
+            # Find BMUs for all data points
+            bmus, _ = self._calculate_bmus_and_qerr(sMap['codebook'], data)
+
+            # Accumulate numerator and denominator for batch update
+            numerator = np.zeros((n_units, data.shape[1]))
+            denominator = np.zeros(n_units)
+
+            # Accumulate contributions from each data point
+            for i, bmu in enumerate(bmus):
+                data_point = data[i]
+
+                for j in range(n_units):
+                    weight = h[bmu, j]
+                    numerator[j] += weight * data_point
+                    denominator[j] += weight
+
+            # Update codebook vectors
+            for i in range(n_units):
+                if denominator[i] > 0:
+                    sMap['codebook'][i] = numerator[i] / denominator[i]
+
+            if self.tracking > 1 and t % (trainlen // 10) == 0:
+                _, qerr = self._calculate_bmus_and_qerr(sMap['codebook'], data)
+                mean_qe = np.mean(qerr)
+                print(f"  Iteration {t}: mean QE = {mean_qe:.6f}, radius = {curr_radius:.2f}")
+
+        # Final quantization error
+        if self.tracking > 0:
+            _, qerr = self._calculate_bmus_and_qerr(sMap['codebook'], data)
+            mean_qe = np.mean(qerr)
+            print(f"  Training complete. Final mean QE = {mean_qe:.6f}")
+
+        return sMap
+
+    def _get_grid_coords(self, msize):
+        """
+        Get the grid coordinates for each unit in the map.
+
+        Parameters:
+        ----------
+        msize : tuple
+            Map size (height, width)
+
+        Returns:
+        -------
+        grid_coords : numpy.ndarray
+            Grid coordinates for each unit
+        """
+        # Create grid coordinates
+        x = np.arange(msize[1])
+        y = np.arange(msize[0])
+
+        xx, yy = np.meshgrid(x, y)
+        grid_coords = np.column_stack((yy.flatten(), xx.flatten()))
+
+        return grid_coords
+
+    def _calculate_neighborhood(self, grid_coords, radius, neigh='gaussian'):
+        """
+        Calculate the neighborhood matrix for the given grid coordinates and radius.
+
+        Parameters:
+        ----------
+        grid_coords : numpy.ndarray
+            Grid coordinates for each unit
+        radius : float
+            Neighborhood radius
+        neigh : str, default='gaussian'
+            Neighborhood function ('gaussian' or 'bubble')
+
+        Returns:
+        -------
+        h : numpy.ndarray
+            Neighborhood matrix
+        """
+        n_units = grid_coords.shape[0]
+        h = np.zeros((n_units, n_units))
+
+        for i in range(n_units):
+            for j in range(n_units):
+                # Calculate Euclidean distance between units on the grid
+                dist = np.sqrt(np.sum((grid_coords[i] - grid_coords[j]) ** 2))
+
+                # Apply neighborhood function
+                if neigh == 'gaussian':
+                    h[i, j] = np.exp(-(dist ** 2) / (2 * (radius ** 2)))
+                elif neigh == 'bubble':
+                    h[i, j] = 1 if dist <= radius else 0
+                else:
+                    # Default to gaussian
+                    h[i, j] = np.exp(-(dist ** 2) / (2 * (radius ** 2)))
+
+        return h
+
+    def _sequential_train(self, map_struct, data, trainlen=20, radius=None, neigh='gaussian', alpha=None):
+        """
+        Sequential training algorithm for SOM.
+
+        Parameters:
+        ----------
+        map_struct : dict
+            Map structure containing codebook and topology
+        data : numpy.ndarray
+            Training data, shape [n_samples, dim]
+        trainlen : int
+            Number of training epochs
+        radius : float or list
+            Neighborhood radius or [initial_radius, final_radius]
+        neigh : str
+            Neighborhood function type
+        alpha : float or list
+            Learning rate or [initial_alpha, final_alpha]
+
+        Returns:
+        -------
+        map_struct : dict
+            Trained map structure
+        """
+        codebook = map_struct['codebook']
+        msize = map_struct['topol']['msize']
+        n_units = codebook.shape[0]
+        n_samples = data.shape[0]
+
+        # Calculate distances between map units (for neighborhood calculation)
+        unit_distances = self._calculate_map_distances(msize)
+
+        # Set default radius if not provided
+        if radius is None:
+            radius = [max(msize) / 2, 0.5]
+
+        # Convert single radius to [initial, final]
+        if np.isscalar(radius):
+            radius = [radius, radius / 4]
+
+        # Set default alpha if not provided
+        if alpha is None:
+            alpha = [0.5, 0.05]
+
+        # Convert single alpha to [initial, final]
+        if np.isscalar(alpha):
+            alpha = [alpha, alpha / 10]
+
+        # Create sequences for each step
+        if len(radius) == 2:
+            total_steps = trainlen * n_samples
+            radius_seq = np.linspace(radius[0], radius[1], total_steps)
+            alpha_seq = np.linspace(alpha[0], alpha[1], total_steps)
+        else:
+            radius_seq = radius
+            trainlen = len(radius) // n_samples
+            alpha_seq = alpha if len(alpha) == len(radius) else np.linspace(alpha[0], alpha[1], len(radius))
+
+        if self.tracking > 0:
+            print(f"Sequential training: {trainlen} epochs, {n_samples} vectors per epoch")
+            print(f"Radius from {radius_seq[0]:.2f} to {radius_seq[-1]:.2f}")
+            print(f"Alpha from {alpha_seq[0]:.2f} to {alpha_seq[-1]:.2f}")
+
+        # Main training loop
+        step = 0
+        for epoch in range(trainlen):
+            if self.tracking > 1:
+                print(f"Epoch {epoch + 1}/{trainlen}")
+
+            # Shuffle data for each epoch
+            indices = np.random.permutation(n_samples)
+
+            # Process each training vector
+            for i in indices:
+                # Get current data vector
+                x = data[i]
+
+                # Find BMU
+                bmu_idx = np.argmin(np.sum(((x - codebook) ** 2), axis=1))
+
+                # Calculate neighborhood
+                h = self._neighborhood_function(unit_distances[bmu_idx], radius_seq[step], neigh)
+
+                # Update codebook vectors
+                for j in range(n_units):
+                    if h[j] > 0:
+                        codebook[j] += alpha_seq[step] * h[j] * (x - codebook[j])
+
+                step += 1
+
+        # Update map structure
+        map_struct['codebook'] = codebook
+        return map_struct
+
+    def _grow_row(self, sMap, msqe_mat, data):
+        """
+        Add a new row to the map at the position of maximum error.
+
+        Parameters:
+        ----------
+        sMap : dict
+            Map structure to grow
+        msqe_mat : numpy.ndarray
+            Mean squared quantization error matrix
+        data : numpy.ndarray
+            Training data
+
+        Returns:
+        -------
+        sMap : dict
+            Updated map structure with a new row
+        """
+        # Get map dimensions
+        msize = sMap['topol']['msize']
+
+        # Calculate the mean error for each row
+        row_errors = np.mean(msqe_mat, axis=1)
+
+        # Find the row with the highest mean error
+        max_error_row = np.argmax(row_errors)
+
+        # Create new map structure with additional row
+        new_msize = (msize[0] + 1, msize[1])
+        new_sMap = self._create_initial_map(new_msize, sMap['codebook'].shape[1])
+
+        # Initialize the positions of new units
+        new_positions = []
+        for i in range(new_msize[0]):
+            for j in range(new_msize[1]):
+                new_unit_idx = i * new_msize[1] + j
+
+                # Determine position in the grid
+                pos = [i, j]
+                new_positions.append(pos)
+
+        new_sMap['topol']['pos'] = np.array(new_positions)
+
+        # Copy the children array structure (or create a new one if needed)
+        if 'children' in sMap:
+            new_sMap['children'] = [None] * (new_msize[0] * new_msize[1])
+
+            # Copy existing children
+            for i in range(msize[0]):
+                for j in range(msize[1]):
+                    old_idx = i * msize[1] + j
+
+                    # Calculate new index (adjusting for the inserted row)
+                    new_i = i if i < max_error_row + 1 else i + 1
+                    new_idx = new_i * new_msize[1] + j
+
+                    if old_idx < len(sMap['children']) and new_idx < len(new_sMap['children']):
+                        new_sMap['children'][new_idx] = sMap['children'][old_idx]
+
+        # Create new codebook
+        new_codebook = np.zeros((new_msize[0] * new_msize[1], sMap['codebook'].shape[1]))
+
+        # Copy rows before the insertion point
+        for i in range(max_error_row + 1):
+            for j in range(msize[1]):
+                old_idx = i * msize[1] + j
+                new_idx = i * new_msize[1] + j
+                new_codebook[new_idx] = sMap['codebook'][old_idx]
+
+        # Initialize the new row
+        for j in range(msize[1]):
+            new_idx = (max_error_row + 1) * new_msize[1] + j
+
+            # Different initialization strategies for the new row
+            if max_error_row == 0:
+                # First row - use the first row as reference
+                ref_idx = j
+                new_codebook[new_idx] = sMap['codebook'][ref_idx] + np.random.normal(0, 0.01,
+                                                                                     size=sMap['codebook'].shape[1])
+            elif max_error_row == msize[0] - 1:
+                # Last row - use the last row as reference
+                ref_idx = max_error_row * msize[1] + j
+                new_codebook[new_idx] = sMap['codebook'][ref_idx] + np.random.normal(0, 0.01,
+                                                                                     size=sMap['codebook'].shape[1])
+            else:
+                # Interpolate between neighboring rows
+                upper_idx = max_error_row * msize[1] + j
+                lower_idx = (max_error_row + 1) * msize[1] + j if max_error_row + 1 < msize[0] else upper_idx
+                new_codebook[new_idx] = 0.5 * (sMap['codebook'][upper_idx] + sMap['codebook'][lower_idx])
+                # Add small noise to break symmetry
+                new_codebook[new_idx] += np.random.normal(0, 0.01, size=sMap['codebook'].shape[1])
+
+        # Copy rows after the insertion point
+        for i in range(max_error_row + 1, msize[0]):
+            for j in range(msize[1]):
+                old_idx = i * msize[1] + j
+                new_idx = (i + 1) * new_msize[1] + j
+                new_codebook[new_idx] = sMap['codebook'][old_idx]
+
+        # Update the map with the new codebook
+        new_sMap['codebook'] = new_codebook
+
+        if self.tracking > 0:
+            print(f"Added row after row {max_error_row}")
+
+        return new_sMap
+
+    def _grow_column(self, sMap, msqe_mat, data):
+        """
+        Add a new column to the map at the position of maximum error.
+
+        Parameters:
+        ----------
+        sMap : dict
+            Map structure to grow
+        msqe_mat : numpy.ndarray
+            Mean squared quantization error matrix
+        data : numpy.ndarray
+            Training data
+
+        Returns:
+        -------
+        sMap : dict
+            Updated map structure with a new column
+        """
+        # Get map dimensions
+        msize = sMap['topol']['msize']
+
+        # Calculate the mean error for each column
+        col_errors = np.mean(msqe_mat, axis=0)
+
+        # Find the column with the highest mean error
+        max_error_col = np.argmax(col_errors)
+
+        # Create new map structure with additional column
+        new_msize = (msize[0], msize[1] + 1)
+        new_sMap = self._create_initial_map(new_msize, sMap['codebook'].shape[1])
+
+        # Initialize the positions of new units
+        new_positions = []
+        for i in range(new_msize[0]):
+            for j in range(new_msize[1]):
+                new_unit_idx = i * new_msize[1] + j
+
+                # Determine position in the grid
+                pos = [i, j]
+                new_positions.append(pos)
+
+        new_sMap['topol']['pos'] = np.array(new_positions)
+
+        # Copy the children array structure (or create a new one if needed)
+        if 'children' in sMap:
+            new_sMap['children'] = [None] * (new_msize[0] * new_msize[1])
+
+            # Copy existing children
+            for i in range(msize[0]):
+                for j in range(msize[1]):
+                    old_idx = i * msize[1] + j
+
+                    # Calculate new index (adjusting for the inserted column)
+                    new_j = j if j < max_error_col + 1 else j + 1
+                    new_idx = i * new_msize[1] + new_j
+
+                    if old_idx < len(sMap['children']) and new_idx < len(new_sMap['children']):
+                        new_sMap['children'][new_idx] = sMap['children'][old_idx]
+
+        # Create new codebook
+        new_codebook = np.zeros((new_msize[0] * new_msize[1], sMap['codebook'].shape[1]))
+
+        # Copy columns before the insertion point
+        for i in range(msize[0]):
+            for j in range(max_error_col + 1):
+                old_idx = i * msize[1] + j
+                new_idx = i * new_msize[1] + j
+                new_codebook[new_idx] = sMap['codebook'][old_idx]
+
+        # Initialize the new column
+        for i in range(msize[0]):
+            new_idx = i * new_msize[1] + max_error_col + 1
+
+            # Different initialization strategies for the new column
+            if max_error_col == 0:
+                # First column - use the first column as reference
+                ref_idx = i * msize[1]
+                new_codebook[new_idx] = sMap['codebook'][ref_idx] + np.random.normal(0, 0.01,
+                                                                                     size=sMap['codebook'].shape[1])
+            elif max_error_col == msize[1] - 1:
+                # Last column - use the last column as reference
+                ref_idx = i * msize[1] + max_error_col
+                new_codebook[new_idx] = sMap['codebook'][ref_idx] + np.random.normal(0, 0.01,
+                                                                                     size=sMap['codebook'].shape[1])
+            else:
+                # Interpolate between neighboring columns
+                left_idx = i * msize[1] + max_error_col
+                right_idx = i * msize[1] + (max_error_col + 1)
+                new_codebook[new_idx] = 0.5 * (sMap['codebook'][left_idx] + sMap['codebook'][right_idx])
+                # Add small noise to break symmetry
+                new_codebook[new_idx] += np.random.normal(0, 0.01, size=sMap['codebook'].shape[1])
+
+        # Copy columns after the insertion point
+        for i in range(msize[0]):
+            for j in range(max_error_col + 1, msize[1]):
+                old_idx = i * msize[1] + j
+                new_idx = i * new_msize[1] + (j + 1)
+                new_codebook[new_idx] = sMap['codebook'][old_idx]
+
+        # Update the map with the new codebook
+        new_sMap['codebook'] = new_codebook
+
+        if self.tracking > 0:
+            print(f"Added column after column {max_error_col}")
+
+        return new_sMap
+
+    def _horizontal_growth(self, sMap, data, msqe_mat=None, tau_2=0.5, max_growth=5):
+        """
+        Grow the map horizontally by adding rows and columns where needed.
+
+        Parameters:
+        ----------
+        sMap : dict
+            Map structure to grow
+        data : numpy.ndarray
+            Training data
+        msqe_mat : numpy.ndarray, optional
+            Mean squared quantization error matrix
+        tau_2 : float, default=0.5
+            Threshold parameter for horizontal growth (lower = more growth)
+        max_growth : int, default=5
+            Maximum number of growth iterations
+
+        Returns:
+        -------
+        sMap : dict
+            Updated map structure after horizontal growth
+        """
+        # Calculate MSQE if not provided
+        if msqe_mat is None:
+            msqe_mat = self._calculate_msqe_matrix(sMap, data)
+
+        # Get map dimensions
+        msize = sMap['topol']['msize']
+
+        # Track if growth occurred
+        growth_occurred = False
+        growth_iterations = 0
+
+        while growth_iterations < max_growth:
+            # Check if a row needs to be added
+            row_errors = np.mean(msqe_mat, axis=1)
+            max_row_error = np.max(row_errors)
+
+            # Check if a column needs to be added
+            col_errors = np.mean(msqe_mat, axis=0)
+            max_col_error = np.max(col_errors)
+
+            # Determine whether to add row or column based on highest error
+            if max_row_error > max_col_error and max_row_error > tau_2:
+                # Add a row
+                sMap = self._grow_row(sMap, msqe_mat, data)
+                growth_occurred = True
+            elif max_col_error > tau_2:
+                # Add a column
+                sMap = self._grow_column(sMap, msqe_mat, data)
+                growth_occurred = True
+            else:
+                # No more growth needed
+                break
+
+            # If growth occurred, retrain the map and recalculate MSQE
+            if growth_occurred:
+                # Train the map with the new structure
+                sMap = self._batch_train(sMap, data,
+                                         trainlen=self.grow_map_trainlen,
+                                         radius=self.grow_map_radius,
+                                         neigh=self.grow_map_neigh)
+
+                # Recalculate MSQE matrix
+                msqe_mat = self._calculate_msqe_matrix(sMap, data)
+
+                growth_iterations += 1
+                growth_occurred = False
+
+                # Get updated map dimensions
+                msize = sMap['topol']['msize']
+
+                if self.tracking > 0:
+                    print(f"Map grown to size {msize[0]}x{msize[1]}")
+            else:
+                break
+
+        return sMap
+
+    def _calculate_msqe_matrix(self, sMap, data):
+        """
+        Calculate the mean squared quantization error matrix for each unit.
+
+        Parameters:
+        ----------
+        sMap : dict
+            Map structure
+        data : numpy.ndarray
+            Training data
+
+        Returns:
+        -------
+        msqe_mat : numpy.ndarray
+            Mean squared quantization error matrix
+        """
+        # Get map dimensions
+        msize = sMap['topol']['msize']
+        n_units = msize[0] * msize[1]
+
+        # Find BMUs for all data points
+        bmus, qerrs = self._calculate_bmus_and_qerr(sMap['codebook'], data)
+
+        # Initialize MSQE matrix and unit hit counts
+        msqe_sum = np.zeros(n_units)
+        hit_counts = np.zeros(n_units)
+
+        # Accumulate errors for each unit
+        for i, bmu in enumerate(bmus):
+            msqe_sum[bmu] += qerrs[i]
+            hit_counts[bmu] += 1
+
+        # Calculate mean error for each unit, handle units with no hits
+        msqe = np.zeros(n_units)
+        for i in range(n_units):
+            if hit_counts[i] > 0:
+                msqe[i] = msqe_sum[i] / hit_counts[i]
+            else:
+                # Assign a high error to units with no hits
+                msqe[i] = np.max(msqe_sum / np.maximum(hit_counts, 1)) * 1.5
+
+        # Reshape to match map dimensions
+        msqe_mat = msqe.reshape(msize[0], msize[1])
+
+        return msqe_mat
+
+    def _vertical_growth(self, sMap, data, labels=None, depth=1, max_depth=3, parent_id=None):
+        """
+        Grow the map vertically by creating child maps for units with high errors.
+        """
+        if sMap.get('_vertical_growth_done', False):
+            if depth == 1:
+                print("🛑 Vertical growth already completed for root map. Skipping.")
+            return sMap
+        sMap['_vertical_growth_done'] = True
+
+        if depth >= max_depth:
+            if not self._printed_max_depth_once:
+                print(f"⛔ Max depth {max_depth} reached at depth {depth}")
+                self._printed_max_depth_once = True
+            return sMap
+
+        # Initialize child structure if missing
+        if 'grown_units' not in sMap:
+            sMap['grown_units'] = set()
+        if 'children' not in sMap:
+            msize = sMap['topol']['msize']
+            sMap['children'] = [None] * (msize[0] * msize[1])
+
+        # Compute QE & BMUs
+        msqe_mat = self._calculate_msqe_matrix(sMap, data)
+        msqe_vec = msqe_mat.flatten()
+        nonzero_errors = msqe_vec[msqe_vec > 0]
+        if len(nonzero_errors) == 0:
+            return sMap
+        mean_qe = np.mean(nonzero_errors)
+
+        if self.tracking > 0:
+            print(f"📊 Mean QE at depth {depth}: {mean_qe:.4f} (tau_1 threshold: {self.tau_1 * mean_qe:.4f})")
+
+        bmus, _ = self._calculate_bmus_and_qerr(sMap['codebook'], data)
+
+        msize = sMap['topol']['msize']
+        n_units = msize[0] * msize[1]
+
+        for i in range(n_units):
+            if i in sMap['grown_units']:
+                continue
+            if sMap['children'][i] is not None:
+                continue
+            if msqe_vec[i] <= self.tau_1 * mean_qe:
+                continue
+
+            unit_data_indices = np.where(bmus == i)[0]
+            if len(unit_data_indices) < self.depth_dataitems:
+                continue
+
+            unit_data = data[unit_data_indices]
+            unit_labels = labels[unit_data_indices] if labels is not None else None
+
+            # Prevent unnecessary map creation for low-variance or nearly identical data
+            if np.allclose(np.std(unit_data, axis=0), 0):
+                continue
+
+            # Train child map
+            child_map = self._create_initial_map((2, 2), unit_data.shape[1])
+            child_map = self._batch_train(child_map, unit_data)
+            child_map = self._horizontal_growth(child_map, unit_data)
+
+            # Link and recurse
+            child_map['parent_unit'] = i
+            child_map['parent_vector'] = sMap['codebook'][i].copy()
+            sMap['children'][i] = child_map
+            sMap['grown_units'].add(i)
+
+            map_id = f"{parent_id}_{i}" if parent_id is not None else f"{i}"
+
+            if self.tracking > 0:
+                print(f"🌱 Vertical growth: created child map at unit {i} (depth {depth})")
+
+            self._vertical_growth(
+                child_map, unit_data, unit_labels,
+                depth=depth + 1, max_depth=max_depth,
+                parent_id=map_id
+            )
+
+        if self.tracking > 0:
+            print(f"✅ Finished vertical growth at depth {depth}")
+        if depth == 1 and self.tracking > 0:
+            print("🎉 Entire vertical growth process completed.\n")
+
+        return sMap
+
+    def _create_initial_map(self, msize, dim):
+        """
+        Create an initial map structure with the given dimensions.
+
+        Parameters:
+        ----------
+        msize : tuple
+            Map size as (rows, columns)
+        dim : int
+            Dimensionality of the codebook vectors
+
+        Returns:
+        -------
+        sMap : dict
+            Initialized map structure
+        """
+        # Calculate number of units
+        n_units = msize[0] * msize[1]
+
+        # Create map structure
+        sMap = {}
+
+        # Create topology structure
+        sMap['topol'] = {
+            'msize': msize,
+            'lattice': 'rect',  # rectangular grid
+        }
+
+        # Initialize codebook with random values
+        sMap['codebook'] = np.random.rand(n_units, dim)
+
+        # Initialize children array (for hierarchical growth)
+        sMap['children'] = [None] * n_units
+
+        return sMap
+
+    def train_ghsom(self, data, labels=None, initial_map_size=(2, 2), max_depth=3, tau_1=0.3, tau_2=0.5, trainlen=50,
+                    radius=None):
+        self._printed_levels = set()
+        self._processed_keys = set()
+        """
+        Train a Growing Hierarchical Self-Organizing Map (GHSOM) on the given data.
+
+        Parameters:
+        ----------
+        data : numpy.ndarray
+            Training data
+        labels : numpy.ndarray, optional
+            Labels for the data points
+        initial_map_size : tuple, default=(2, 2)
+            Initial size of the root map
+        max_depth : int, default=3
+            Maximum depth of the hierarchy
+        tau_1 : float, default=0.3
+            Threshold for vertical growth (lower value = more child maps)
+        tau_2 : float, default=0.5
+            Threshold for horizontal growth (lower value = larger maps)
+        trainlen : int, default=5
+            Number of training iterations
+        radius : float, optional
+            Initial neighborhood radius
+
+        Returns:
+        -------
+        ghsom : dict
+            Trained GHSOM structure
+        """
+        # Store config
+        self.max_depth = max_depth
+        self.tau_1 = tau_1
+        self.tau_2 = tau_2
+        self.initial_trainlen = trainlen
+
+        if self.tracking > 0:
+            print(f"📊 Training GHSOM with parameters: max_depth={max_depth}, tau_1={tau_1}, tau_2={tau_2}")
+
+        # Step 1: Create and train the root map
+        ghsom = self._create_initial_map(initial_map_size, data.shape[1])
+        ghsom = self._batch_train(ghsom, data, trainlen=trainlen, radius=radius)
+
+        # Step 2: Grow horizontally
+        ghsom = self._horizontal_growth(ghsom, data, tau_2=tau_2)
+
+        # Step 3: Grow hierarchically (vertical growth)
+        ghsom = self._vertical_growth(ghsom, data, labels)
+
+        # Step 4: Compute root map's MQE
+        _, qerrs = self._calculate_bmus_and_qerr(ghsom['codebook'], data)
+        mqe0 = np.mean(qerrs)
+        ghsom['labels'] = labels
+
+        # Optional: Save vertical map IDs
+        if hasattr(self, 'vertical_map_ids') and self.vertical_map_ids:
+            import pandas as pd
+            pd.DataFrame({'map_id': self.vertical_map_ids}).to_csv("Results/vertical_map_ids.csv", index=False)
+
+        # Step 7: Return structured output
+        return {
+            'root_map': ghsom,
+            'mqe0': mqe0,
+            'submaps': {},
+            'depth': tau_1,
+            'breadth': tau_2,
+            'data': data,
+            'labels': labels
+        }
+
+
+
+    def get_bmu_data(self, ghsom, data, labels=None, max_depth=None):
+        """
+        Get the data assigned to each BMU across all levels of the GHSOM.
+
+        Parameters:
+        ----------
+        ghsom : dict
+            The trained GHSOM structure
+        data : numpy.ndarray
+            Data to find BMUs for
+        labels : numpy.ndarray, optional
+            Labels for the data points
+        max_depth : int, optional
+            Maximum depth to traverse (None for all levels)
+
+        Returns:
+        -------
+        bmu_data : dict
+            Dictionary mapping from unit ids to data indices
+        """
+        # Initialize the result dictionary
+        bmu_data = {}
+
+        # Process the root map
+        self._get_bmu_data_recursive(ghsom, data, labels, bmu_data, '', 0, max_depth)
+
+        return bmu_data
+
+    def _get_bmu_data_recursive(self, sMap, data, labels, bmu_data, prefix, level, max_depth):
+        """
+        Recursively traverse the GHSOM to find BMUs for data at each level.
+
+        Parameters:
+        ----------
+        sMap : dict
+            Current map structure
+        data : numpy.ndarray
+            Data to find BMUs for
+        labels : numpy.ndarray, optional
+            Labels for the data points
+        bmu_data : dict
+            Dictionary to store BMU data (modified in-place)
+        prefix : str
+            Prefix for unit IDs at this level
+        level : int
+            Current hierarchy level
+        max_depth : int, optional
+            Maximum depth to traverse (None for all levels)
+        """
+        # Check if we've reached the maximum depth
+        if max_depth is not None and level > max_depth:
+            return
+
+        # Get map dimensions
+        msize = sMap['topol']['msize']
+        n_units = msize[0] * msize[1]
+
+        # Find BMUs for all data points at this level
+        bmus, _ = self._calculate_bmus_and_qerr(sMap['codebook'], data)
+
+        # Store data indices for each BMU
+        for i in range(n_units):
+            # Create unit ID with prefix
+            unit_id = f"{prefix}_{i}" if prefix else f"{i}"
+
+            # Get data indices for this BMU
+            data_indices = np.where(bmus == i)[0]
+
+            # Store in the result dictionary
+            bmu_data[unit_id] = {
+                'data_indices': data_indices,
+                'level': level,
+                'map_size': msize,
+                'n_samples': len(data_indices)
+            }
+
+            # Add labels if provided
+            if labels is not None:
+                bmu_data[unit_id]['labels'] = labels[data_indices]
+
+            # Recursively process child map if it exists
+            if sMap['children'][i] is not None:
+                child_data = data[data_indices]
+                child_labels = None
+                if labels is not None:
+                    child_labels = labels[data_indices]
+
+                # Recursively get BMUs for the child map
+                self._get_bmu_data_recursive(
+                    sMap['children'][i],
+                    child_data,
+                    child_labels,
+                    bmu_data,
+                    unit_id,
+                    level + 1,
+                    max_depth
+                )
+
+    def calculate_quantization_error(self, ghsom, data, return_by_level=False):
+        """
+        Calculate the quantization error of the GHSOM for the given data.
+
+        Parameters:
+        ----------
+        ghsom : dict
+            The trained GHSOM structure
+        data : numpy.ndarray
+            Data to calculate quantization error for
+        return_by_level : bool, default=False
+            Whether to return errors by hierarchy level
+
+        Returns:
+        -------
+        qerror : float or dict
+            Mean quantization error, or dict of errors by level if return_by_level=True
+        """
+        # Get BMU data for all levels
+        bmu_data = self.get_bmu_data(ghsom, data)
+
+        # Calculate overall error
+        total_qerror = 0.0
+        total_samples = 0
+
+        # Track errors by level if requested
+        level_errors = {}
+
+        # Process each unit across all levels
+        for unit_id, unit_info in bmu_data.items():
+            level = unit_info['level']
+            data_indices = unit_info['data_indices']
+
+            if len(data_indices) == 0:
+                continue
+
+            # Get the map and unit index
+            if '_' in unit_id:
+                # Child unit - need to traverse the hierarchy
+                parts = unit_id.split('_')
+                current_map = ghsom
+
+                for i in range(len(parts) - 1):
+                    parent_idx = int(parts[i])
+                    current_map = current_map['children'][parent_idx]
+
+                unit_idx = int(parts[-1])
+            else:
+                # Root level unit
+                current_map = ghsom
+                unit_idx = int(unit_id)
+
+            # Get data for this unit
+            unit_data = data[data_indices]
+
+            # Get codebook vector for this unit
+            codebook_vector = current_map['codebook'][unit_idx]
+
+            # Calculate squared distances
+            sq_dist = np.sum((unit_data - codebook_vector) ** 2, axis=1)
+
+            # Sum up the error
+            unit_qerror = np.sum(sq_dist)
+            total_qerror += unit_qerror
+            total_samples += len(data_indices)
+
+            # Track by level if requested
+            if return_by_level:
+                if level not in level_errors:
+                    level_errors[level] = {'qerror': 0.0, 'samples': 0}
+
+                level_errors[level]['qerror'] += unit_qerror
+                level_errors[level]['samples'] += len(data_indices)
+
+        # Calculate mean error
+        mean_qerror = total_qerror / total_samples if total_samples > 0 else 0.0
+
+        # Calculate mean error by level if requested
+        if return_by_level:
+            for level in level_errors:
+                if level_errors[level]['samples'] > 0:
+                    level_errors[level]['mean_qerror'] = level_errors[level]['qerror'] / level_errors[level]['samples']
+                else:
+                    level_errors[level]['mean_qerror'] = 0.0
+
+            return level_errors
+        else:
+            return mean_qerror
+
