@@ -1,0 +1,817 @@
+import warnings
+
+
+warnings.filterwarnings('ignore')
+
+import os
+import logging
+from pathlib import Path
+from typing import Tuple, List, Dict, Any
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import networkx as nx
+import random
+from CORE_CLASS.GHSOM_Train import GHSOMTrain
+from CORE_CLASS.GHSOM import GHSOM
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold
+from scipy.stats import norm
+from neuroCombat import neuroCombat
+from sklearn.metrics import silhouette_score
+from scipy.stats import chisquare
+
+
+
+# ----------------------------------------------------------------
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('som_analysis.log'),
+        logging.StreamHandler()
+    ]
+)
+
+################################################################################
+class SOMAnalysis:
+    def __init__(self, data_dir: str = "Updated_DATA", n_jobs: int = None, seed: int = 42):
+        self.data_dir = Path(data_dir)
+        self.setup_directories()
+        self.n_jobs = n_jobs or os.cpu_count()
+        self.df_metadata: pd.DataFrame = pd.DataFrame()
+        self.seed = seed
+        np.random.seed(self.seed)
+        random.seed(seed)
+
+
+    def setup_directories(self):
+        Path("Layer2").mkdir(exist_ok=True)
+        Path("Results").mkdir(exist_ok=True)
+
+    def preprocess_data(self, only_cd: bool = False) -> pd.DataFrame:
+        # can change true to false
+        """
+        Load, clean, harmonize, and scale the dataset. Returns a DataFrame ready for SOM training.
+        """
+        try:
+            # Read raw data from fixed path
+            data_path = "/Users/adam/Desktop/CD_SOM2/CODE/Data/FemNAT_Neuro_psych_main.csv"
+            df_raw = pd.read_csv(data_path)
+            onset_series = df_raw['CD_OnsetType'].copy()
+
+            # Keep original IDs
+            ids = df_raw['ID'].astype(str)
+
+            # Rename columns
+            df_raw.rename(columns={
+                'CD_items_current_Aggression_sum': 'Aggression',
+                'CD_items_current_Destruction_sum': 'Destruction',
+                'CD_items_current_RuleViolation_sum': 'Rule Violation',
+                'CD_items_current_DeceitfulnessTheft_sum': 'Deceitfulness/Theft',
+                'ICU_IMPUTED_total_sum_imp': 'Callousness',
+                'ODD_items_fulfilled_current': 'ODD',
+                'ADHD_current_Impulsivity_Hyperactivity_count': 'ADHD',
+                'KSLDC_DIAG_Dep_acute': 'Depression',
+                'KSLDC_DIAG_Anx_acute': 'Anxiety',
+                'KSLDC_DIAG_PTSD_acute': 'PTSD',
+                'KSLDC_DIAG_OCD_acute': 'OCD',
+                'Anger_ACC': 'Anger',
+                'Disgust_ACC': 'Disgust',
+                'Fear_ACC': 'Fear',
+                'Happy_ACC': 'Happiness',
+                'Sad_ACC': 'Sadness',
+                'Surprise_ACC': 'Surprise',
+                'eIQ_total': 'IQ',
+                'Sex': 'Sex',
+                'Age': 'Age',
+                'centre': 'centre'
+            }, inplace=True)
+
+            # Core variables
+            selected_columns = [
+                'Aggression',
+                'Destruction',
+                'Rule Violation',
+                'Deceitfulness/Theft',
+                'Callousness',
+                'ODD',
+                'ADHD',
+                'Depression',
+                'Anxiety',
+                'PTSD',
+                'OCD',
+                'Anger',
+                'Disgust',
+                'Fear',
+                'Happiness',
+                'Sadness',
+                'Surprise',
+                'IQ',
+                'Sex',
+                'Age',
+                'centre'
+            ]
+
+            # Coerce hit and false-alarm rates to numeric to avoid string entries
+            rate_cols = ['FArate_EmoControl_RES', 'HitRate_EmoControl_RES',
+                         'FArate_CogControl_RES', 'HitRate_CogControl_RES']
+            for col in rate_cols:
+                df_raw[col] = pd.to_numeric(df_raw[col], errors='coerce')
+
+            # d-prime helper
+            from scipy.stats import norm
+            def _compute_dprime(hit, fa, eps=1e-5):
+                hr = np.clip(hit, eps, 1 - eps)
+                fr = np.clip(fa, eps, 1 - eps)
+                return norm.ppf(hr) - norm.ppf(fr)
+
+            # Compute d-prime for control tasks
+            df_raw['dprime_EmoControl'] = _compute_dprime(
+                df_raw['HitRate_EmoControl_RES'],
+                df_raw['FArate_EmoControl_RES']
+            )
+            df_raw['dprime_CogControl'] = _compute_dprime(
+                df_raw['HitRate_CogControl_RES'],
+                df_raw['FArate_CogControl_RES']
+
+            )
+
+            # Rename for clarity
+            df_raw.rename(columns={
+                'dprime_EmoControl': 'Emotive Control',
+                'dprime_CogControl': 'Cognitive Control'
+            }, inplace=True)
+
+            selected_columns += ['Emotive Control', 'Cognitive Control']
+
+
+            # Subset and coerce
+            df_subset = df_raw[selected_columns].replace('', pd.NA)
+            df_subset = df_subset.apply(pd.to_numeric, errors='coerce')
+
+            # Drop constants and missing
+            df_subset = df_subset.loc[:, df_subset.nunique() > 1]
+            df_subset = df_subset.dropna(subset=['Sex', 'centre']).dropna()
+
+            # Align IDs
+            ids_subset = ids[df_subset.index].reset_index(drop=True)
+            df_subset = df_subset.reset_index(drop=True)
+            raw_age = df_subset['Age'].copy()
+
+            # Harmonize
+            covars = df_subset[['Sex', 'centre']].rename(columns={'Sex': 'gender', 'centre': 'batch'})
+            features = df_subset.drop(columns=['Sex', 'centre', 'Age'])
+            if covars['gender'].nunique() > 1 and covars['batch'].nunique() > 1:
+                harmonized = neuroCombat(
+                    dat=features.T,
+                    covars=covars,
+                    batch_col='batch',
+                    categorical_cols=['gender']
+                )["data"].T
+                df_harmonized = pd.DataFrame(harmonized, index=features.index, columns=features.columns)
+            else:
+                logging.warning("Skipping neuroCombat: insufficient variability")
+                df_harmonized = features
+
+            # Scale
+            scaler = StandardScaler()
+            df_scaled = pd.DataFrame(
+                scaler.fit_transform(df_harmonized),
+                index=features.index, columns=features.columns
+            ).clip(-3, 3)
+
+            # Final clean
+            df_clean_feat = df_scaled.reset_index(drop=True)
+            df_clean = df_clean_feat.copy()
+            df_clean.insert(0, 'ID', ids_subset)
+            df_clean.insert(1, 'Sex', df_subset['Sex'])
+            df_clean.insert(2, 'Age_raw', raw_age)
+            df_clean['Group'] = np.where(
+                df_clean['ID'].astype(int) <= 542, 'CD', 'Control'
+            )
+
+            # pull onset based on the same original rows you subsetted
+            df_clean['CD_OnsetType'] = onset_series.iloc[df_subset.index].values
+
+            # now filter to CD-only if requested
+            if only_cd:
+                df_clean = df_clean[df_clean['Group'] == 'CD']
+
+            # now include CD_OnsetType in our metadata
+            self.df_metadata = df_clean[['ID', 'Sex', 'Group', 'Age_raw', 'CD_OnsetType']].copy()
+            df_to_return = df_clean.drop(columns=['Sex', 'Group', 'Age_raw', 'CD_OnsetType'])
+            df_to_return.to_csv(
+                "/Users/adam/Desktop/CD_SOM2/CODE/Data/FemNAT_cleaned_encoded.csv", index=False
+            )
+
+            # Plots
+            self._plot_histograms(df_clean_feat)
+            self._plot_boxplots(df_clean_feat)
+            self._plot_correlation_heatmap(df_clean_feat)
+
+            return df_to_return
+
+        except Exception as e:
+            logging.error(f"Error in preprocessing: {e}")
+            raise
+    def _plot_histograms(self, data: pd.DataFrame):
+        plt.figure(figsize=(15,10))
+        n = len(data.columns)
+        for i, var in enumerate(data.columns, 1):
+            plt.subplot(2, int(np.ceil(n/2)), i)
+            plt.hist(data[var], bins=20)
+            plt.title(var)
+        plt.tight_layout()
+        plt.savefig('Results/variable_histograms.png')
+        plt.close()
+
+    def _plot_boxplots(self, data: pd.DataFrame):
+        plt.figure(figsize=(15,10))
+        n = len(data.columns)
+        for i, var in enumerate(data.columns, 1):
+            plt.subplot(2, int(np.ceil(n/2)), i)
+            plt.boxplot(data[var])
+            plt.title(var)
+        plt.tight_layout()
+        plt.savefig('Results/variable_boxplots.png')
+        plt.close()
+
+    def _plot_correlation_heatmap(self, data: pd.DataFrame):
+        corr = data.corr()
+        plt.figure(figsize=(12,10))
+        plt.imshow(corr, cmap='viridis', aspect='auto')
+        plt.colorbar()
+        plt.xticks(range(len(data.columns)), data.columns, rotation=45)
+        plt.yticks(range(len(data.columns)), data.columns)
+        plt.tight_layout()
+        plt.savefig('Results/correlation_heatmap.png')
+        plt.close()
+
+    def run_analysis(
+            self,
+            data: pd.DataFrame,
+            breadth: float,
+            depth: float,
+            bootsze: int = 100
+    ) -> Dict[str, Any]:
+        self.df_clean = data.copy()
+        self.breadth = breadth
+        self.depth = depth
+        logging.info(f"Using seed = {self.seed} for this run")
+
+        # Prepare data
+        labels = data['ID'].values
+        features = data.drop(columns=['ID'], errors=True)
+
+        np.random.seed(self.seed)
+        # Train GHSOM
+        master_struct = self.train_ghsom(features, breadth, depth, labels)
+        self.ghsom_struct = master_struct
+        master_codebook = master_struct['root_map']['codebook']
+
+        # Compute and store Layer-1 silhouette
+        from sklearn.metrics import silhouette_score
+        root_bmus = master_struct['root_map']['bmus']  # flat labels for root map
+        X = features.values
+        sil1 = silhouette_score(X, root_bmus, metric='euclidean')
+        logging.info(f"Layer-1 silhouette score: {sil1:.3f}")
+        self.silhouette_score = sil1
+
+        # Export & extract Layer-2 clusters
+        self.export_ghsom_to_gexf(master_struct['root_map'], path='Results/ghsom.gexf')
+        l2 = self._extract_layer2_clusters(master_struct, labels, features)
+
+        # Compute and store Layer-2 silhouette
+        # Build label array for Layer-2 assignments
+        id_to_idx = {id_: i for i, id_ in enumerate(labels)}
+        layer2_labels = np.empty(len(labels), dtype=object)
+        for (unit, sub), ids in l2.items():
+            for id_ in ids:
+                layer2_labels[id_to_idx[id_]] = f"{unit}.{sub}"
+        sil2 = silhouette_score(X, layer2_labels, metric='euclidean')
+        logging.info(f"Layer-2 silhouette score: {sil2:.3f}")
+        self.layer2_silhouette = sil2
+
+        # Write Layer-2 Excel (summary, profiles, and silhouettes)
+        self._write_layer2_excel(l2)
+
+        # Plot Layer-2 spider profiles
+        self._plot_spider_profiles_layer2(features, l2)
+
+        # Permutation tests (MQE)
+        perm = self._run_permutation_analysis(data=features, bootsze=bootsze, codebook=master_codebook)
+        self._plot_permutation_results(
+            perm_true=perm['perm_true_mqe'],
+            perm_null=perm['perm_null_mqe']
+        )
+
+        return {
+            'ghsom_structure': master_struct,
+            'silhouette_layer1': sil1,
+            'silhouette_layer2': sil2,
+            'permutation_results': perm
+        }
+
+
+    def _train_test_layer2_mqe(
+            self,
+            num_folds: int,
+            splits: List[Tuple[np.ndarray, np.ndarray]],
+            data: pd.DataFrame
+    ) -> List[float]:
+        mqes = []
+        root_cb = self.ghsom_struct['root_map']['codebook']
+        child_cbs = {
+            u: child['codebook']
+            for u, child in enumerate(self.ghsom_struct['root_map']['children'])
+            if child is not None
+        }
+
+        for tr_idx, te_idx in splits:
+            test = data.iloc[te_idx].values
+            for vec in test:
+                # 1) root BMU
+                pu = np.argmin(np.sum((root_cb - vec) ** 2, axis=1))
+                # 2) only if pu has a Layer‑2 codebook
+                if pu in child_cbs:
+                    d2 = np.min(np.sum((child_cbs[pu] - vec) ** 2, axis=1))
+                    mqes.append(d2)
+                # else: skip this vector entirely
+
+        return mqes
+
+    def _compute_null_mqe_by_layer2_shuffle(
+            self,
+            num_folds: int,
+            splits: List[Tuple[np.ndarray, np.ndarray]],
+            data: pd.DataFrame,
+            seed_offset: int
+    ) -> List[float]:
+        """
+        Null MQE by shuffling feature columns to destroy multivariate structure:
+        1) For each bootstrap iteration, permute each feature column independently using a unique seed.
+        2) Compute MQE between these scrambled vectors and the original codebooks.
+        """
+        null_mqe = []
+        root = self.ghsom_struct['root_map']
+        child_cbs = {
+            u: child['codebook']
+            for u, child in enumerate(root['children'])
+            if child is not None
+        }
+        # create a scrambled version of the full data once per iteration
+        rng = np.random.RandomState(self.seed + seed_offset)
+        scrambled = data.copy().apply(lambda col: rng.permutation(col.values), axis=0)
+
+        for tr_idx, te_idx in splits:
+            # use scrambled test vectors
+            test_scrambled = scrambled.iloc[te_idx].values
+            for vec in test_scrambled:
+                # compute root distances
+                d2_root = np.sum((root['codebook'] - vec) ** 2, axis=1)
+                pu = np.argmin(d2_root)
+                cb_sub = child_cbs.get(pu)
+                if cb_sub is not None:
+                    d2_sub = np.sum((cb_sub - vec) ** 2, axis=1)
+                    null_mqe.append(np.min(d2_sub))
+                else:
+                    null_mqe.append(np.min(d2_root))
+        return null_mqe
+
+    def _run_permutation_analysis(
+            self,
+            data: pd.DataFrame,
+            bootsze: int,
+            codebook: np.ndarray
+    ) -> Dict[str, np.ndarray]:
+        num_folds, splits = self._create_folds(data)
+
+        # True MQE from Layer-2 BMUs
+        true_mqe = self._train_test_layer2_mqe(num_folds, splits, data)
+
+        # Null MQE via feature-wise shuffling per bootstrap
+        null_mqe = []
+        for i in range(bootsze):
+            null_mqe.extend(
+                self._compute_null_mqe_by_layer2_shuffle(
+                    num_folds, splits, data, seed_offset=i
+                )
+            )
+        return {
+            'perm_true_mqe': np.array(true_mqe),
+            'perm_null_mqe': np.array(null_mqe)
+        }
+
+    def cross_validated_mqe(self, data: pd.DataFrame, breadth: float, depth: float, n_splits: int = 5):
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.seed)
+        all_mqe = []
+
+        labels = data['ID'].values
+        features = data.drop(columns=['ID'], errors=True)
+
+        for fold_idx, (train_idx, test_idx) in enumerate(kf.split(features)):
+            X_train, X_test = features.iloc[train_idx], features.iloc[test_idx]
+            y_train, y_test = labels[train_idx], labels[test_idx]
+
+            # Train GHSOM on train fold
+            struct = self.train_ghsom(X_train, breadth, depth, y_train)
+            codebook = struct['root_map']['codebook']
+            root_cb = codebook
+
+            # For each test sample, calculate MQE to nearest codebook unit
+            for vec in X_test.values:
+                d2 = np.sum((root_cb - vec) ** 2, axis=1)
+                min_d2 = np.min(d2)
+                all_mqe.append(min_d2)
+
+            print(f"Fold {fold_idx + 1}/{n_splits} done.")
+
+        # Combine all MQEs from all folds
+        return np.array(all_mqe)
+
+
+    def cross_validated_permutation_test_layer2(
+            self, data: pd.DataFrame, breadth: float, depth: float, n_splits: int = 5, n_perms: int = 100
+    ):
+        """
+        Cross-validated permutation test for Layer 2 clusters:
+        For each test fold, assign to root unit, then (if exists) to Layer 2 unit and compute MQE to Layer 2 codebook.
+        """
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.seed)
+        labels = data['ID'].values
+        features = data.drop(columns=['ID'], errors=True)
+
+        all_true_mqe = []
+        all_null_mqe = []
+
+        for fold_idx, (train_idx, test_idx) in enumerate(kf.split(features)):
+            X_train, X_test = features.iloc[train_idx], features.iloc[test_idx]
+            y_train = labels[train_idx]
+
+            # Train GHSOM on train fold
+            struct = self.train_ghsom(X_train, breadth, depth, y_train)
+            root_cb = struct['root_map']['codebook']
+            root_children = struct['root_map']['children']
+
+            # Build a dict of child codebooks for fast lookup
+            child_cbs = {
+                u: child['codebook']
+                for u, child in enumerate(root_children)
+                if child is not None
+            }
+
+            # --- TRUE MQE: Assign each test sample to root unit, then child unit if exists ---
+            for vec in X_test.values:
+                # 1. Find BMU at root
+                d2_root = np.sum((root_cb - vec) ** 2, axis=1)
+                pu = np.argmin(d2_root)
+                # 2. If Layer 2 child exists, use its codebook for closest subunit
+                if pu in child_cbs:
+                    cb2 = child_cbs[pu]
+                    d2_sub = np.sum((cb2 - vec) ** 2, axis=1)
+                    min_d2 = np.min(d2_sub)
+                else:
+                    # No child, fallback to root MQE
+                    min_d2 = np.min(d2_root)
+                all_true_mqe.append(min_d2)
+
+            # --- NULL MQE: Permute test set features n_perms times, repeat same process ---
+            for _ in range(n_perms):
+                # Shuffle each feature column *independently*
+                X_test_perm = X_test.apply(np.random.permutation, axis=0).reset_index(drop=True)
+                for vec in X_test_perm.values:
+                    # Recalculate BMU (root unit) for this permuted vector
+                    d2_root = np.sum((root_cb - vec) ** 2, axis=1)
+                    pu = np.argmin(d2_root)
+                    # If Layer 2 child exists, use its codebook
+                    if pu in child_cbs:
+                        cb2 = child_cbs[pu]
+                        d2_sub = np.sum((cb2 - vec) ** 2, axis=1)
+                        min_d2 = np.min(d2_sub)
+                    else:
+                        min_d2 = np.min(d2_root)
+                    all_null_mqe.append(min_d2)
+
+            print(f"Fold {fold_idx + 1}/{n_splits} (Layer 2 MQE) done.")
+
+        return np.array(all_true_mqe), np.array(all_null_mqe)
+
+    def _plot_permutation_results(
+            self,
+            perm_true: np.ndarray,
+            perm_null: np.ndarray,
+            outpath: str = 'Results/perm_mqe_density.png'
+    ):
+        """
+        Plot filled histograms of true vs. null MQE, label their means,
+        and show a prominent p-value in the bottom-right.
+        """
+        mu_true = perm_true.mean()
+        mu_null = perm_null.mean()
+
+        # Compute one‐tailed p-value
+        p_val = np.mean(perm_null <= mu_true)
+
+        # Set up figure
+        plt.figure(figsize=(8, 6))
+
+        # Filled histograms
+        plt.hist(perm_null, bins=50, density=True, alpha=0.3,
+                 color='steelblue', label='Null MQE')
+        plt.hist(perm_true, bins=50, density=True, alpha=0.3,
+                 color='darkorange', label='True MQE')
+
+        ymin, ymax = plt.ylim()
+        xmin, xmax = plt.xlim()
+        label_ypos = ymax * 0.88
+        x_offset = (xmax - xmin) * 0.06
+        min_x = xmin + (xmax - xmin) * 0.13  # 13% of the width away from left
+
+        def draw_mean_line(mu, color, label, xoffset=0, align='center'):
+            plt.vlines(mu, ymin * 0.1, ymax * 0.9, colors=color,
+                       linestyles='--', linewidth=2)
+            x = mu + xoffset
+            # If label would collide with y-axis, bump right AND align left
+            if x < min_x:
+                x = min_x
+                align = 'left'
+            if x > xmax - (xmax - xmin) * 0.05:
+                x = mu - abs(xoffset)
+                align = 'right'
+            plt.text(x, label_ypos, f'{label}\n{mu:.2f}',
+                     ha=align, va='bottom', color=color,
+                     fontsize=13, fontweight='bold',
+                     backgroundcolor='white', alpha=0.92, zorder=10)
+
+        # True mean left, Null mean right, both at safe y-height and with large enough offset
+        draw_mean_line(mu_true, 'darkorange', 'True mean', xoffset=-x_offset, align='right')
+        draw_mean_line(mu_null, 'steelblue', 'Null mean', xoffset=+x_offset, align='left')
+        # p-value in bottom-right
+        plt.text(
+            0.95, 0.05, f'p = {p_val:.3f}',
+            transform=plt.gca().transAxes,
+            ha='right', va='bottom',
+            fontsize=12, fontweight='bold',
+            bbox=dict(boxstyle='round', facecolor='white',
+                      edgecolor='gray', alpha=0.8)
+        )
+
+        # Labels & legend
+        plt.xlabel('Quantization Error (squared)')
+        plt.ylabel('Density')
+        plt.title('Permutation Test: MQE Distributions')
+        plt.legend(loc='upper right')
+        plt.tight_layout()
+        plt.savefig(outpath, dpi=150)
+        plt.close()
+
+    def _create_folds(self, data: pd.DataFrame) -> Tuple[int, List[Tuple[np.ndarray, np.ndarray]]]:
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        return 5, list(kf.split(data))
+
+    def export_ghsom_to_gexf(
+            self,
+            ghsom_root,
+            path: str = "Results/ghsom_force.gexf",
+            layout_scale: float = 1.0
+    ):
+        """
+        Export a GHSOM hierarchy to a GEXF graph using a Fruchterman–Reingold layout.
+
+        :param ghsom_root: nested dict representing the GHSOM hierarchy
+        :param path: output path for the GEXF file
+        :param layout_scale: scaling factor for the force-directed layout
+        """
+        # 1. Build the directed hierarchy
+        G = nx.DiGraph()
+
+        def traverse(node, name="root", depth=0, group=None):
+            # Group name is the top-level cluster identifier
+            group = name if depth == 1 else group
+            rows, cols = node['topol']['msize']
+            G.add_node(
+                name,
+                label=f"{name} [{rows}×{cols}]",
+                level=depth,
+                parent_group=group or "root"
+            )
+            for idx, child in enumerate(node.get('children', [])):
+                if child is None:
+                    continue
+                child_name = f"{name}.{idx}"
+                G.add_edge(name, child_name)
+                traverse(child, child_name, depth + 1, group)
+
+        traverse(ghsom_root)
+
+        # 2. Compute force-directed positions using Fruchterman-Reingold
+        #    'scale' controls the overall spread of the layout
+        positions = nx.spring_layout(G, scale=layout_scale)
+
+        # 3. Write positions into the graph as x,y attributes
+        for node, (x, y) in positions.items():
+            G.nodes[node]['x'] = float(x)
+            G.nodes[node]['y'] = float(y)
+
+        # 4. Export to GEXF
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        nx.write_gexf(G, path)
+        print(f"Exported GHSOM with force-directed layout to {path}")
+
+    def train_ghsom(
+        self,
+        data: pd.DataFrame,
+        breadth: float,
+        depth: float,
+        labels: np.ndarray
+    ) -> Dict[str, Any]:
+        # ensure reproducible initialization
+        np.random.seed(self.seed)
+        ghsom = GHSOM(
+            tau_1=depth, tau_2=breadth,
+            max_depth=3, initial_map_size=(2,2), tracking=3,
+        )
+        struct = ghsom.train(data.values, labels=labels)
+        self._save_ghsom_results(struct)
+        return struct
+
+    def _extract_layer2_clusters(
+        self,
+        struct: Dict[str, Any],
+        labels: np.ndarray,
+        data: pd.DataFrame
+    ) -> Dict[Tuple[int,int], List[str]]:
+        clusters = {}
+        root = struct['root_map']
+        bmus = root['bmus']
+        for unit, child in enumerate(root.get('children', [])):
+            if child is None:
+                continue
+            mask = bmus == unit
+            subs = labels[mask]
+            subdata = data.values[mask]
+            trainer = GHSOMTrain(data=subdata, labels=None)
+            bmus_sub, _ = trainer._calculate_bmus_and_qerr(child['codebook'], subdata)
+            for sc in np.unique(bmus_sub):
+                clusters[(unit, int(sc))] = subs[bmus_sub == sc].tolist()
+        return clusters
+
+    def _write_layer2_excel(self, sheets: Dict[Tuple[int, int], List[str]]):
+        from collections import defaultdict
+
+        # Aggregate IDs by parent unit
+        out = defaultdict(list)
+        for (unit, sub), ids in sheets.items():
+            out[unit].extend(ids)
+
+        # Prepare rows for summary and profile
+        summary_rows = []
+        profile_rows = []
+
+        # Create Excel writer
+        with pd.ExcelWriter('Layer2/L2_clusters.xlsx') as writer:
+            # Per-unit ID and Sex details
+            for unit, ids in out.items():
+                meta = self.df_metadata[self.df_metadata['ID'].isin(ids)].copy()
+                meta['Sex'] = meta['Sex'].map({1: 'Female', 2: 'Male'})
+                meta[['ID', 'Sex']].to_excel(writer, f'Unit_{unit}_IDs', index=False)
+
+                # Summary metrics
+                summary_rows.append({
+                    'Unit': unit,
+                    'Total': len(ids),
+                    'Male_CD': int(((meta.Sex == 'Male') & (meta.Group == 'CD')).sum()),
+                    'Female_CD': int(((meta.Sex == 'Female') & (meta.Group == 'CD')).sum()),
+                    'Male_Control': int(((meta.Sex == 'Male') & (meta.Group == 'Control')).sum()),
+                    'Female_Control': int(((meta.Sex == 'Female') & (meta.Group == 'Control')).sum()),
+                    # --- new onset‐type counts ---
+                    'OnsetType_4': int((meta['CD_OnsetType'] == 4).sum()),
+                    'OnsetType_5': int((meta['CD_OnsetType'] == 5).sum()),
+                    'OnsetType_6': int((meta['CD_OnsetType'] == 6).sum())
+                })
+
+                # Mean feature profile
+                feature_data = self.df_clean[self.df_clean['ID'].isin(ids)]
+                drop_cols = [c for c in ['ID', 'Sex', 'Group', 'Age_raw'] if c in feature_data.columns]
+                profile = feature_data.drop(columns=drop_cols).mean().to_dict()
+                profile.update({
+                    'Unit': unit,
+                    'Mean_Age': self.df_metadata[self.df_metadata['ID'].isin(ids)]['Age_raw'].mean()
+                })
+                profile_rows.append(profile)
+
+            # Write summary and profile sheets
+            pd.DataFrame(summary_rows).to_excel(writer, 'L2_Summary', index=False)
+            pd.DataFrame(profile_rows).to_excel(writer, 'L2_Profiles', index=False)
+
+            # Goodness-of-Fit: Compare observed gender ratio to expected (default = 50/50)
+            gof_results = []
+            for unit, ids in out.items():
+                meta = self.df_metadata[self.df_metadata['ID'].isin(ids)].copy()
+                meta['Sex'] = meta['Sex'].map({1: 'Female', 2: 'Male'})
+                counts = meta['Sex'].value_counts()
+                observed = [counts.get('Male', 0), counts.get('Female', 0)]
+                total = sum(observed)
+                if total < 2:  # Skip underpopulated units
+                    continue
+                all_counts = self.df_metadata['Sex'].map({1: 'Female', 2: 'Male'}).value_counts()
+                prop_male = all_counts.get('Male', 0) / all_counts.sum()
+                prop_female = all_counts.get('Female', 0) / all_counts.sum()
+                expected = [total * prop_male, total * prop_female]
+
+                if all(e > 0 for e in expected):
+                    chi2, p = chisquare(f_obs=observed, f_exp=expected)
+                    gof_results.append({
+                        'Unit': unit,
+                        'Male_Observed': observed[0],
+                        'Female_Observed': observed[1],
+                        'Expected_Male': expected[0],
+                        'Expected_Female': expected[1],
+                        'Chi2': chi2,
+                        'p_value': p
+                    })
+
+            if gof_results:
+                pd.DataFrame(gof_results).to_excel(writer, 'Gender_GOF', index=False)
+                logging.info("Gender goodness-of-fit results written to 'Gender_GOF'.")
+            else:
+                logging.warning("No valid GOF results (e.g., insufficient data in some units).")
+            # Write silhouette metrics if computed
+            metrics = []
+            if hasattr(self, 'silhouette_score'):
+                metrics.append({'Metric': 'Silhouette_Layer1', 'Value': self.silhouette_score})
+            if hasattr(self, 'layer2_silhouette'):
+                metrics.append({'Metric': 'Silhouette_Layer2', 'Value': self.layer2_silhouette})
+            if metrics:
+                pd.DataFrame(metrics).to_excel(writer, 'Silhouette_Metrics', index=False)
+
+    def _plot_spider_profiles_layer2(
+        self,
+        features: pd.DataFrame,
+        sheets: Dict[Tuple[int, int], List[str]]
+    ):
+        """
+        Plot one spider profile per unit (layer-2 parent),
+        combining all its sub-clusters into a single mean profile.
+        """
+        id2idx = {id_: i for i, id_ in enumerate(self.df_clean['ID'])}
+        cols = features.columns.tolist()
+        N = len(cols)
+        angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist() + [0]
+
+        unit_to_ids: Dict[int, List[str]] = {}
+        for (unit, sub), ids in sheets.items():
+            unit_to_ids.setdefault(unit, []).extend(ids)
+
+        for u, ids in unit_to_ids.items():
+            idxs = [id2idx[i] for i in ids if i in id2idx]
+            if not idxs:
+                continue
+            vals = features.iloc[idxs].mean(axis=0).tolist()
+            vals += [vals[0]]
+
+            fig, ax = plt.subplots(subplot_kw={'polar': True}, figsize=(6, 6))
+            ax.plot(angles, vals, linewidth=2)
+            ax.fill(angles, vals, alpha=0.25)
+            ax.set_thetagrids(np.degrees(angles[:-1]), cols, fontsize=8)
+            ax.set_ylim(-2, 3)
+            ax.set_yticks([-2,  0,  2,])
+            ax.set_title(f'Profile {u + 1}', y=1.1)
+
+            outfile = f'Results/spider_unit{u}.png'
+            fig.savefig(outfile, bbox_inches='tight', dpi=150)
+            plt.close(fig)
+
+    def _save_ghsom_results(self, struct: Dict[str, Any]):
+        np.savetxt('Layer2/NWT_V1.csv', struct['root_map']['codebook'], delimiter=',')
+        np.savetxt('Layer2/DPP_V1.csv', np.ones(len(struct['root_map']['codebook'])), delimiter=',')
+        np.save('Results/GHSOM_Struct.npy', struct)
+
+def main():
+    analysis = SOMAnalysis()
+    scaled = analysis.preprocess_data(only_cd=True)
+    breadth = 0.3
+    depth = 0.1
+
+    analysis.run_analysis(
+        data=scaled,
+        breadth=breadth,
+        depth=depth,
+        bootsze=100  # or whatever you want
+    )
+
+    # Layer 2 cross-validated permutation test!
+    true_mqe, null_mqe = analysis.cross_validated_permutation_test_layer2(
+        scaled, breadth, depth, n_splits=5, n_perms=20
+    )
+
+    analysis._plot_permutation_results(true_mqe, null_mqe)
+    np.savetxt('Results/CV_LAYER2_TRUE_MQE.csv', true_mqe, delimiter=',')
+    np.savetxt('Results/CV_LAYER2_NULL_MQE.csv', null_mqe, delimiter=',')
+    logging.info('Layer 2 cross-validated permutation analysis completed successfully')
+
+if __name__ == '__main__':
+    main()
