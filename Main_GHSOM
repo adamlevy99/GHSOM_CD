@@ -7,7 +7,6 @@ import os
 import logging
 from pathlib import Path
 from typing import Tuple, List, Dict, Any
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -21,7 +20,8 @@ from scipy.stats import norm
 from neuroCombat import neuroCombat
 from sklearn.metrics import silhouette_score
 from scipy.stats import chisquare
-
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.stats import chi2_contingency, f_oneway
 
 
 # ----------------------------------------------------------------
@@ -34,6 +34,60 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+def compute_meta_cluster_stability(
+    cv_path: str = "Results/CV_MetaCluster_Assignments.csv",
+    out_path: str = "Results/CV_MetaCluster_Stability.csv"
+) -> pd.DataFrame:
+    """
+    Compute per-subject meta-cluster stability from cross-validation assignments.
+
+    Input file must have columns: ['ID', 'Repeat', 'Fold', 'MetaCluster'].
+
+    Stability = (# of repeats where subject is in its most common meta-cluster)
+                / (total # of repeats for that subject, including NaNs)
+    """
+    df = pd.read_csv(cv_path)
+
+    rows = []
+    for sid, sub in df.groupby("ID"):
+        mc = sub["MetaCluster"]
+
+        # non-missing assignments
+        non_na = mc.dropna()
+        num_repeats = len(sub)         # includes NaNs
+        num_assigned = len(non_na)     # excludes NaNs
+
+        if num_assigned == 0:
+            most_cluster = None
+            stability = np.nan
+        else:
+            vals, counts = np.unique(non_na.astype(int).values, return_counts=True)
+            most_cluster = vals[np.argmax(counts)]
+            # IMPORTANT: divide by total repeats, not only assigned ones
+            stability = counts.max() / float(num_repeats)
+
+        rows.append({
+            "ID": sid,
+            "MostCommonMetaCluster": most_cluster,
+            "Stability": stability,
+            "NumRepeats": num_repeats,
+            "NumAssigned": num_assigned
+        })
+
+    df_stab = pd.DataFrame(rows).sort_values("Stability", ascending=False)
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    df_stab.to_csv(out_path, index=False)
+
+    print("=== Meta-cluster stability summary ===")
+    print(f"N subjects: {len(df_stab)}")
+    print(f"Mean stability:  {df_stab['Stability'].mean():.3f}")
+    print(f"Median stability:{df_stab['Stability'].median():.3f}")
+    print("Stability quantiles:")
+    print(df_stab["Stability"].quantile([0.1, 0.25, 0.5, 0.75, 0.9]))
+
+    return df_stab
 
 ################################################################################
 class SOMAnalysis:
@@ -51,7 +105,7 @@ class SOMAnalysis:
         Path("Layer2").mkdir(exist_ok=True)
         Path("Results").mkdir(exist_ok=True)
 
-    def preprocess_data(self, only_cd: bool = False) -> pd.DataFrame:
+    def preprocess_data(self, only_cd: bool = True) -> pd.DataFrame:
         # can change true to false
         """
         Load, clean, harmonize, and scale the dataset. Returns a DataFrame ready for SOM training.
@@ -72,12 +126,12 @@ class SOMAnalysis:
                 'CD_items_current_RuleViolation_sum': 'Rule Violation',
                 'CD_items_current_DeceitfulnessTheft_sum': 'Deceitfulness/Theft',
                 'ICU_IMPUTED_total_sum_imp': 'Callousness',
-                'ODD_items_fulfilled_current': 'ODD',
-                'ADHD_current_Impulsivity_Hyperactivity_count': 'ADHD',
-                'KSLDC_DIAG_Dep_acute': 'Depression',
-                'KSLDC_DIAG_Anx_acute': 'Anxiety',
-                'KSLDC_DIAG_PTSD_acute': 'PTSD',
-                'KSLDC_DIAG_OCD_acute': 'OCD',
+               # 'ODD_items_fulfilled_current': 'ODD',
+                #'ADHD_current_Impulsivity_Hyperactivity_count': 'ADHD',
+                #'KSLDC_DIAG_Dep_acute': 'Depression',
+                #'KSLDC_DIAG_Anx_acute': 'Anxiety',
+                #'KSLDC_DIAG_PTSD_acute': 'PTSD',
+                #'KSLDC_DIAG_OCD_acute': 'OCD',
                 'Anger_ACC': 'Anger',
                 'Disgust_ACC': 'Disgust',
                 'Fear_ACC': 'Fear',
@@ -97,12 +151,12 @@ class SOMAnalysis:
                 'Rule Violation',
                 'Deceitfulness/Theft',
                 'Callousness',
-                'ODD',
-                'ADHD',
-                'Depression',
-                'Anxiety',
-                'PTSD',
-                'OCD',
+                #'ODD',
+                #'ADHD',
+                #'Depression',
+                #'Anxiety',
+                #'PTSD',
+                #'OCD',
                 'Anger',
                 'Disgust',
                 'Fear',
@@ -200,8 +254,37 @@ class SOMAnalysis:
             if only_cd:
                 df_clean = df_clean[df_clean['Group'] == 'CD']
 
-            # now include CD_OnsetType in our metadata
-            self.df_metadata = df_clean[['ID', 'Sex', 'Group', 'Age_raw', 'CD_OnsetType']].copy()
+            # ---- build metadata with external clinical variables (NOT used in SOM) ----
+            meta = df_clean[['ID', 'Sex', 'Group', 'Age_raw', 'CD_OnsetType']].copy()
+
+            # pull diagnostic variables from the raw dataframe, aligned by ID
+            diag_cols = [
+                'ODD_items_fulfilled_current',
+                'ADHD_current_Impulsivity_Hyperactivity_count',
+                'KSLDC_DIAG_Dep_acute',
+                'KSLDC_DIAG_Anx_acute',
+                'KSLDC_DIAG_PTSD_acute',
+                'KSLDC_DIAG_OCD_acute'
+            ]
+            diag_raw = df_raw[['ID'] + diag_cols].copy()
+            diag_raw['ID'] = diag_raw['ID'].astype(str)  # align with df_clean IDs
+
+            # merge into metadata
+            meta = meta.merge(diag_raw, on='ID', how='left')
+
+            # rename to nice clinical names
+            meta.rename(columns={
+                'ODD_items_fulfilled_current': 'ODD',
+                'ADHD_current_Impulsivity_Hyperactivity_count': 'ADHD',
+                'KSLDC_DIAG_Dep_acute': 'Depression',
+                'KSLDC_DIAG_Anx_acute': 'Anxiety',
+                'KSLDC_DIAG_PTSD_acute': 'PTSD',
+                'KSLDC_DIAG_OCD_acute': 'OCD',
+            }, inplace=True)
+
+            self.df_metadata = meta
+
+            # Data used for SOM (no clinical/metadata columns)
             df_to_return = df_clean.drop(columns=['Sex', 'Group', 'Age_raw', 'CD_OnsetType'])
             df_to_return.to_csv(
                 "/Users/adam/Desktop/CD_SOM2/CODE/Data/FemNAT_cleaned_encoded.csv", index=False
@@ -257,35 +340,50 @@ class SOMAnalysis:
             depth: float,
             bootsze: int = 100
     ) -> Dict[str, Any]:
+        """
+        Full GHSOM analysis pipeline:
+          - train GHSOM
+          - compute L1 and L2 silhouette
+          - extract Layer-2 clusters
+          - build Layer-2 meta-clusters
+          - run permutation analysis on MQE
+        """
+        # keep a copy of the SOM input (with ID col)
         self.df_clean = data.copy()
         self.breadth = breadth
         self.depth = depth
         logging.info(f"Using seed = {self.seed} for this run")
 
-        # Prepare data
+        # ------------------------
+        # 1) Prepare data + train GHSOM
+        # ------------------------
         labels = data['ID'].values
         features = data.drop(columns=['ID'], errors=True)
 
         np.random.seed(self.seed)
-        # Train GHSOM
         master_struct = self.train_ghsom(features, breadth, depth, labels)
         self.ghsom_struct = master_struct
         master_codebook = master_struct['root_map']['codebook']
 
-        # Compute and store Layer-1 silhouette
-        from sklearn.metrics import silhouette_score
+        # ------------------------
+        # 2) Layer-1 silhouette
+        # ------------------------
         root_bmus = master_struct['root_map']['bmus']  # flat labels for root map
         X = features.values
         sil1 = silhouette_score(X, root_bmus, metric='euclidean')
         logging.info(f"Layer-1 silhouette score: {sil1:.3f}")
         self.silhouette_score = sil1
 
-        # Export & extract Layer-2 clusters
+        # ------------------------
+        # 3) Export + Layer-2 clusters
+        # ------------------------
         self.export_ghsom_to_gexf(master_struct['root_map'], path='Results/ghsom.gexf')
         l2 = self._extract_layer2_clusters(master_struct, labels, features)
+        self.l2_clusters = l2  # store for later use
 
-        # Compute and store Layer-2 silhouette
-        # Build label array for Layer-2 assignments
+        # ------------------------
+        # 4) Layer-2 silhouette (using raw L2 labels)
+        # ------------------------
         id_to_idx = {id_: i for i, id_ in enumerate(labels)}
         layer2_labels = np.empty(len(labels), dtype=object)
         for (unit, sub), ids in l2.items():
@@ -295,21 +393,49 @@ class SOMAnalysis:
         logging.info(f"Layer-2 silhouette score: {sil2:.3f}")
         self.layer2_silhouette = sil2
 
-        # Write Layer-2 Excel (summary, profiles, and silhouettes)
+        # ------------------------
+        # 5) Write Layer-2 Excel + spider plots (raw L2)
+        # ------------------------
         self._write_layer2_excel(l2)
-
-        # Plot Layer-2 spider profiles
         self._plot_spider_profiles_layer2(features, l2)
 
-        # Permutation tests (MQE)
-        perm = self._run_permutation_analysis(data=features, bootsze=bootsze, codebook=master_codebook)
+        # ------------------------
+        # 6) Build meta-clusters from Layer-2 clusters
+        # ------------------------
+        meta_clusters, df_assign, df_profiles, l2_to_meta = self.create_layer2_meta_clusters(
+            l2_clusters=l2,
+            n_meta=4,  # <- change this to 4, 5, etc. if you want a different number
+            save_path="Layer2/L2_MetaClusters.xlsx"
+        )
+        self.l2_meta_clusters = meta_clusters
+        self.l2_meta_assignments = df_assign
+        self.l2_meta_profiles = df_profiles
+        self.l2_to_meta = l2_to_meta
+
+        self.plot_spider_profiles_meta_clusters()
+
+        # ------------------------
+        # 7) Permutation test (MQE) at layer-2
+        # ------------------------
+        perm = self._run_permutation_analysis(
+            data=features,
+            bootsze=bootsze,
+            codebook=master_codebook
+        )
         self._plot_permutation_results(
             perm_true=perm['perm_true_mqe'],
             perm_null=perm['perm_null_mqe']
         )
 
+        # ------------------------
+        # 8) Return everything useful
+        # ------------------------
         return {
             'ghsom_structure': master_struct,
+            'layer2_clusters': l2,
+            'meta_clusters': meta_clusters,
+            'meta_assignments': df_assign,
+            'meta_profiles': df_profiles,
             'silhouette_layer1': sil1,
             'silhouette_layer2': sil2,
             'permutation_results': perm
@@ -499,6 +625,121 @@ class SOMAnalysis:
 
         return np.array(all_true_mqe), np.array(all_null_mqe)
 
+    def cross_validated_meta_clusters(
+            self,
+            data: pd.DataFrame,
+            breadth: float,
+            depth: float,
+            n_splits: int = 5,
+            n_meta: int = 3,
+            n_repeats: int = 5
+    ) -> pd.DataFrame:
+        """
+        Cross-validate META-CLUSTER assignments.
+
+        For each repeat and fold:
+          - train GHSOM on the training set
+          - build Layer-2 clusters and meta-clusters on the training set
+          - assign test subjects to nearest meta-cluster
+
+        Writes Results/CV_MetaCluster_Assignments.csv with columns:
+          ID, Repeat, Fold, MetaCluster
+        """
+        labels = data["ID"].values
+        features = data.drop(columns=["ID"], errors=True)
+
+        assignments = []
+        original_df_clean = getattr(self, "df_clean", None)
+
+        for rep in range(n_repeats):
+            kf = KFold(
+                n_splits=n_splits,
+                shuffle=True,
+                random_state=self.seed + rep  # different split each repeat
+            )
+
+            for fold_idx, (train_idx, test_idx) in enumerate(kf.split(features)):
+                X_train = features.iloc[train_idx].reset_index(drop=True)
+                X_test = features.iloc[test_idx].reset_index(drop=True)
+                y_train = labels[train_idx]
+                y_test = labels[test_idx]
+
+                # df_clean must match the TRAIN data for meta-cluster building
+                self.df_clean = pd.concat(
+                    [pd.Series(y_train, name="ID"), X_train],
+                    axis=1
+                )
+
+                # ---- Train GHSOM on TRAIN fold ----
+                struct = self.train_ghsom(X_train, breadth, depth, y_train)
+                root = struct["root_map"]
+                root_cb = root["codebook"]
+                children = root["children"]
+
+                # ---- Extract L2 clusters on TRAIN fold ----
+                l2_train = self._extract_layer2_clusters(
+                    struct,
+                    labels=y_train,
+                    data=X_train
+                )
+
+                # ---- Build meta-clusters on TRAIN fold ----
+                (
+                    meta_clusters,
+                    df_assign,
+                    df_profiles,
+                    l2_to_meta
+                ) = self.create_layer2_meta_clusters(
+                    l2_clusters=l2_train,
+                    n_meta=n_meta,
+                    save_path=f"Layer2/L2_MetaClusters_CV_rep{rep + 1}_fold{fold_idx + 1}.xlsx"
+                )
+
+                # Precompute which L2 sub-units exist for each root unit
+                root_to_allowed_subs: Dict[int, List[int]] = {}
+                for (root_u, sub_u) in l2_train.keys():
+                    root_to_allowed_subs.setdefault(root_u, []).append(sub_u)
+
+                # ---- Assign TEST subjects to meta-clusters ----
+                for sid, vec in zip(y_test, X_test.values):
+                    # 1) root BMU
+                    d2_root = np.sum((root_cb - vec) ** 2, axis=1)
+                    root_unit = int(np.argmin(d2_root))
+
+                    meta_id = None
+
+                    # 2) Only search among sub-units that actually existed in training
+                    if (
+                            root_unit < len(children)
+                            and children[root_unit] is not None
+                            and root_unit in root_to_allowed_subs
+                    ):
+                        allowed_subs = root_to_allowed_subs[root_unit]
+                        l2_cb_full = children[root_unit]["codebook"]
+                        # take only allowed subunits
+                        l2_cb = l2_cb_full[allowed_subs, :]
+                        d2_l2 = np.sum((l2_cb - vec) ** 2, axis=1)
+                        chosen_sub = allowed_subs[int(np.argmin(d2_l2))]
+                        meta_id = l2_to_meta.get((root_unit, chosen_sub), None)
+
+                    assignments.append({
+                        "ID": sid,
+                        "Repeat": rep + 1,
+                        "Fold": fold_idx + 1,
+                        "MetaCluster": meta_id
+                    })
+
+                print(f"Repeat {rep + 1}, fold {fold_idx + 1}/{n_splits} done.")
+
+        # restore original df_clean
+        if original_df_clean is not None:
+            self.df_clean = original_df_clean
+
+        df_cv = pd.DataFrame(assignments)
+        df_cv.to_csv("Results/CV_MetaCluster_Assignments.csv", index=False)
+        logging.info("Meta-cluster CV assignments written to Results/CV_MetaCluster_Assignments.csv")
+        return df_cv
+
     def _plot_permutation_results(
             self,
             perm_true: np.ndarray,
@@ -659,6 +900,344 @@ class SOMAnalysis:
                 clusters[(unit, int(sc))] = subs[bmus_sub == sc].tolist()
         return clusters
 
+    def create_layer2_meta_clusters(
+            self,
+            l2_clusters: Dict[Tuple[int, int], List[str]],
+            n_meta: int = 3,
+            save_path: str = "Layer2/L2_MetaClusters.xlsx"
+    ):
+        """
+        Create meta-clusters by merging Layer-2 GHSOM clusters that
+        have similar mean feature profiles.
+
+        Parameters
+        ----------
+        l2_clusters : dict
+            Output of _extract_layer2_clusters:
+            keys: (root_unit, sub_unit), values: list of subject IDs.
+        n_meta : int
+            Desired number of meta-clusters (e.g. 3–5).
+        save_path : str
+            Excel file to write assignments and profiles to.
+
+        Returns
+        -------
+        meta_clusters : Dict[int, List[str]]
+            Mapping meta-cluster ID -> list of subject IDs.
+        df_assign : pd.DataFrame
+            Per-subject assignments with columns:
+            ['ID', 'L2_Cluster', 'MetaCluster']
+        df_profiles : pd.DataFrame
+            Mean feature profile per meta-cluster (scaled features).
+        """
+        if not hasattr(self, "df_clean"):
+            raise RuntimeError("df_clean must be set (run run_analysis first).")
+
+        # 1) feature columns (SOM input features)
+        feature_cols = [c for c in self.df_clean.columns if c not in ["ID"]]
+        cluster_keys = list(l2_clusters.keys())
+
+        # Compute mean feature profile for each original L2 cluster
+        profiles = []
+        for key in cluster_keys:
+            ids = l2_clusters[key]
+            rows = self.df_clean[self.df_clean["ID"].isin(ids)]
+            if rows.empty:
+                profiles.append(np.zeros(len(feature_cols)))
+            else:
+                profiles.append(rows[feature_cols].mean().values)
+
+        profiles = np.vstack(profiles)  # shape: [n_L2_clusters, n_features]
+
+        # 2) Hierarchical clustering of these cluster profiles
+        Z = linkage(profiles, method="ward")
+        meta_labels = fcluster(Z, t=n_meta, criterion="maxclust")  # labels 1..n_meta
+
+        # Map each original L2 cluster -> meta-cluster ID
+        l2_to_meta: Dict[Tuple[int, int], int] = {
+            key: int(m) for key, m in zip(cluster_keys, meta_labels)
+        }
+
+        # 3) Build meta-cluster -> subject ID list
+        meta_clusters: Dict[int, List[str]] = {}
+        for key, meta_id in l2_to_meta.items():
+            meta_clusters.setdefault(meta_id, []).extend(l2_clusters[key])
+
+        # 4) Build subject-level assignment DataFrame
+        assign_rows = []
+        for (root_u, sub_u), ids in l2_clusters.items():
+            meta_id = l2_to_meta[(root_u, sub_u)]
+            for sid in ids:
+                assign_rows.append({
+                    "ID": sid,
+                    "L2_Cluster": f"{root_u}.{sub_u}",
+                    "MetaCluster": meta_id
+                })
+        df_assign = pd.DataFrame(assign_rows)
+
+        # 5) Compute meta-cluster mean feature profiles
+        df_tmp = self.df_clean.merge(df_assign[["ID", "MetaCluster"]], on="ID")
+        df_profiles = (
+            df_tmp
+            .groupby("MetaCluster")[feature_cols]
+            .mean()
+            .reset_index()
+            .sort_values("MetaCluster")
+        )
+
+        # 6) Optionally save to Excel
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with pd.ExcelWriter(save_path) as writer:
+            df_assign.to_excel(writer, "Assignments", index=False)
+            df_profiles.to_excel(writer, "Profiles", index=False)
+
+        logging.info(
+            f"Created {df_profiles['MetaCluster'].nunique()} "
+            f"meta-clusters from {len(cluster_keys)} Layer-2 clusters."
+        )
+
+        # store for later use if you like
+        self.l2_meta_clusters = meta_clusters
+        self.l2_meta_assignments = df_assign
+        self.l2_meta_profiles = df_profiles
+        self.l2_to_meta = l2_to_meta
+
+        return meta_clusters, df_assign, df_profiles, l2_to_meta
+
+    def build_meta_cluster_clinical_df(self) -> pd.DataFrame:
+        """
+        Merge meta-cluster assignments with clinical metadata and SOM features.
+        Returns a DataFrame with:
+          ID, MetaCluster, clinical vars, and SOM feature vars (e.g. IQ).
+        """
+        if not hasattr(self, "l2_meta_assignments"):
+            raise RuntimeError("Meta-clusters not found. Run run_analysis() first.")
+
+        df_assign = self.l2_meta_assignments  # columns: ID, L2_Cluster, MetaCluster
+
+        # Merge with clinical metadata
+        df = df_assign.merge(self.df_metadata, on="ID", how="left")
+
+        # Merge with SOM features (e.g. IQ, Aggression, etc.)
+        if hasattr(self, "df_clean"):
+            df = df.merge(self.df_clean, on="ID", how="left")
+
+        return df
+
+    def compare_meta_clusters_categorical(self, df: pd.DataFrame, variable: str):
+        """
+        Chi-square + Cramér's V for a categorical clinical variable vs MetaCluster.
+        Assumes df contains columns 'MetaCluster' and the given variable.
+        """
+        table = pd.crosstab(df["MetaCluster"], df[variable])
+
+        if table.size == 0 or table.to_numpy().sum() == 0:
+            logging.warning(f"No data for categorical variable '{variable}'.")
+            return None
+
+        chi2, p, dof, expected = chi2_contingency(table)
+
+        n = table.to_numpy().sum()
+        k = min(table.shape)
+        cramers_v = np.sqrt(chi2 / (n * (k - 1))) if k > 1 else np.nan
+
+        logging.info(
+            f"[Categorical] {variable}: chi2={chi2:.2f}, p={p:.4f}, "
+            f"Cramér's V={cramers_v:.3f}"
+        )
+
+        return {
+            "variable": variable,
+            "chi2": chi2,
+            "p": p,
+            "cramers_v": cramers_v,
+            "table": table
+        }
+
+    def compare_meta_clusters_continuous(self, df: pd.DataFrame, variable: str):
+        """
+        One-way ANOVA + eta-squared for a continuous variable vs MetaCluster.
+        """
+        if variable not in df.columns:
+            logging.warning(f"Continuous variable '{variable}' not found in dataframe.")
+            return None
+
+        grouped = df.groupby("MetaCluster")[variable]
+        groups = [g.dropna().values for _, g in grouped]
+
+        # Need at least 2 non-empty groups
+        groups = [g for g in groups if len(g) > 0]
+        if len(groups) <= 1:
+            logging.warning(f"Not enough non-empty groups for variable '{variable}'.")
+            return None
+
+        F, p = f_oneway(*groups)
+
+        # eta-squared
+        all_vals = df[variable].dropna().values
+        grand_mean = np.mean(all_vals)
+        ss_between = sum(len(g) * (np.mean(g) - grand_mean) ** 2 for g in groups)
+        ss_total = np.sum((all_vals - grand_mean) ** 2)
+        eta2 = ss_between / ss_total if ss_total > 0 else np.nan
+
+        logging.info(
+            f"[Continuous] {variable}: F={F:.2f}, p={p:.4f}, eta^2={eta2:.3f}"
+        )
+
+        return {
+            "variable": variable,
+            "F": F,
+            "p": p,
+            "eta2": eta2
+        }
+
+    def run_meta_cluster_clinical_analysis(
+            self,
+            cat_vars=None,
+            cont_vars=None,
+            outpath="Results/MetaCluster_Clinical_Stats.xlsx"
+    ):
+        """
+        Produces two sheets:
+
+        Sheet 1: Diagnoses (ODD, ADHD, Depression, Anxiety, PTSD, OCD)
+            - % per cluster
+            - Chi-square
+            - p-value
+            - Cramer's V
+
+        Sheet 2: Demographics & clustering info
+            - Age_mean per cluster + ANOVA, p, eta2
+            - Sex % per cluster + chi-square, p, Cramer's V
+            - CD_OnsetType % per cluster + chi-square, p, Cramer's V
+            - N per cluster (no significance test)
+        """
+
+        df = self.build_meta_cluster_clinical_df()
+
+        # Diagnoses (categorical)
+        if cat_vars is None:
+            cat_vars = ["ODD", "ADHD", "Depression", "Anxiety", "PTSD", "OCD"]
+
+        # Table 2: Age + Sex + OnsetType (NO IQ)
+        if cont_vars is None:
+            cont_vars = ["Age_raw", "Sex", "CD_OnsetType"]
+
+        diag_rows = []
+        demo_rows = []
+
+        # ===========================
+        # N per cluster (simple count)
+        # ===========================
+        cluster_sizes = df["MetaCluster"].value_counts().sort_index()
+        for cluster, count in cluster_sizes.items():
+            demo_rows.append({
+                "Variable": "N_per_cluster",
+                f"Cluster{cluster}": count
+            })
+
+        # ===========================
+        # 1. DIAGNOSES (categorical)
+        # ===========================
+        for var in cat_vars:
+            if var not in df.columns:
+                continue
+
+            table = pd.crosstab(df["MetaCluster"], df[var])
+            chi2, p, dof, expected = chi2_contingency(table)
+
+            # effect size
+            n = table.sum().sum()
+            k = min(table.shape)
+            cramers_v = np.sqrt(chi2 / (n * (k - 1))) if k > 1 else np.nan
+
+            pct = (table.div(table.sum(axis=1), axis=0) * 100).round(1)
+
+            row = {
+                "Variable": var,
+                "Chi2": chi2,
+                "p": p,
+                "CramersV": cramers_v,
+            }
+
+            # Add % per cluster
+            for cluster in pct.index:
+                # % of diagnosis present (value == 1)
+                row[f"Cluster{cluster}_%"] = pct.loc[cluster].get(1, 0)
+
+            diag_rows.append(row)
+
+        # ===================================
+        # 2. DEMOGRAPHICS & CONTINUOUS VARS
+        # ===================================
+        for var in cont_vars:
+            if var not in df.columns:
+                continue
+
+            # ------------------------------
+            # Continuous (AGE only)
+            # ------------------------------
+            if var == "Age_raw":  # continuous
+                groups = [g.dropna().values for _, g in df.groupby("MetaCluster")[var]]
+                F, p = f_oneway(*groups)
+
+                # effect size: eta squared
+                all_vals = df[var].dropna().values
+                grand_mean = all_vals.mean()
+                ss_between = sum(len(g) * (g.mean() - grand_mean) ** 2 for g in groups)
+                ss_total = ((all_vals - grand_mean) ** 2).sum()
+                eta2 = ss_between / ss_total if ss_total > 0 else np.nan
+
+                means = df.groupby("MetaCluster")[var].mean()
+
+                row = {
+                    "Variable": var,
+                    "F": F,
+                    "p": p,
+                    "Eta2": eta2,
+                }
+                for cluster, m in means.items():
+                    row[f"Cluster{cluster}_Mean"] = round(m, 2)
+
+                demo_rows.append(row)
+
+            # -----------------------------------
+            # Sex + OnsetType (categorical)
+            # -----------------------------------
+            else:
+                table = pd.crosstab(df["MetaCluster"], df[var])
+                chi2, p, dof, expected = chi2_contingency(table)
+
+                n = table.sum().sum()
+                k = min(table.shape)
+                cramers_v = np.sqrt(chi2 / (n * (k - 1))) if k > 1 else np.nan
+
+                pct = (table.div(table.sum(axis=1), axis=0) * 100).round(1)
+
+                row = {
+                    "Variable": var,
+                    "Chi2": chi2,
+                    "p": p,
+                    "CramersV": cramers_v
+                }
+
+                # cluster percentages for first category
+                for cluster in pct.index:
+                    row[f"Cluster{cluster}_%"] = pct.loc[cluster].iloc[0]
+
+                demo_rows.append(row)
+
+        # ===========================
+        # SAVE TO EXCEL
+        # ===========================
+        os.makedirs(os.path.dirname(outpath), exist_ok=True)
+        with pd.ExcelWriter(outpath) as writer:
+            pd.DataFrame(diag_rows).to_excel(writer, "Diagnoses", index=False)
+            pd.DataFrame(demo_rows).to_excel(writer, "Demographics", index=False)
+
+        logging.info(f"Clinical analysis written to {outpath}")
+        return diag_rows, demo_rows
+
     def _write_layer2_excel(self, sheets: Dict[Tuple[int, int], List[str]]):
         from collections import defaultdict
 
@@ -790,28 +1369,118 @@ class SOMAnalysis:
         np.savetxt('Layer2/DPP_V1.csv', np.ones(len(struct['root_map']['codebook'])), delimiter=',')
         np.save('Results/GHSOM_Struct.npy', struct)
 
+    def plot_spider_profiles_meta_clusters(self):
+        """
+        Create one spider plot per META-cluster
+        using mean scaled feature values.
+        """
+
+        if not hasattr(self, "l2_meta_assignments"):
+            raise RuntimeError("No meta-clusters found. Run run_analysis() first.")
+
+        df = self.df_clean.merge(
+            self.l2_meta_assignments[["ID", "MetaCluster"]],
+            on="ID",
+            how="left"
+        )
+
+        feature_cols = [c for c in self.df_clean.columns if c != "ID"]
+        cols = feature_cols
+        N = len(cols)
+
+        angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+        angles += angles[:1]
+
+        for meta in sorted(df["MetaCluster"].dropna().unique()):
+            sub = df[df["MetaCluster"] == meta]
+
+            if len(sub) < 2:
+                continue
+
+            values = sub[feature_cols].mean().tolist()
+            values += values[:1]
+
+            fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={'polar': True})
+
+            ax.plot(angles, values, linewidth=2, label=f'Meta {meta}')
+            ax.fill(angles, values, alpha=0.25)
+
+            ax.set_thetagrids(np.degrees(angles[:-1]), cols, fontsize=8)
+            ax.set_ylim(-2, 3)
+            ax.set_yticks([-2, 0, 2])
+
+            plt.title(f'Meta-Cluster {meta} Profile', y=1.1)
+
+            outfile = f"Results/spider_meta_{meta}.png"
+            plt.savefig(outfile, bbox_inches="tight", dpi=150)
+            plt.close()
+
+            print(f"Saved: {outfile}")
+
 def main():
     analysis = SOMAnalysis()
     scaled = analysis.preprocess_data(only_cd=True)
+
     breadth = 0.3
     depth = 0.1
 
+    # ---------------------------
+    # Run full GHSOM + meta-cluster analysis
+    # ---------------------------
     analysis.run_analysis(
         data=scaled,
         breadth=breadth,
         depth=depth,
-        bootsze=100  # or whatever you want
+        bootsze=100
     )
 
-    # Layer 2 cross-validated permutation test!
-    true_mqe, null_mqe = analysis.cross_validated_permutation_test_layer2(
-        scaled, breadth, depth, n_splits=5, n_perms=20
+    # ---------------------------
+    # META-CLUSTER STABILITY TEST
+    # ---------------------------
+    df_cv_meta = analysis.cross_validated_meta_clusters(
+        data=scaled,
+        breadth=breadth,
+        depth=depth,
+        n_splits=5,
+        n_meta=4     # <-- MUST MATCH the n_meta used in run_analysis() above
     )
 
-    analysis._plot_permutation_results(true_mqe, null_mqe)
-    np.savetxt('Results/CV_LAYER2_TRUE_MQE.csv', true_mqe, delimiter=',')
-    np.savetxt('Results/CV_LAYER2_NULL_MQE.csv', null_mqe, delimiter=',')
-    logging.info('Layer 2 cross-validated permutation analysis completed successfully')
+    # ---------------------------
+    # Compute stability summary
+    # ---------------------------
+    df_stab = compute_meta_cluster_stability(
+        cv_path="Results/CV_MetaCluster_Assignments.csv",
+        out_path="Results/CV_MetaCluster_Stability.csv"
+    )
+
+    print("\nFirst few stability rows:")
+    print(df_stab.head())
+
+    print("\nFirst few meta-cluster CV assignments:")
+    print(df_cv_meta.head())
+
+    # ---------------------------
+    # Clinical comparison (two outputs now)
+    # ---------------------------
+    diag_stats, demo_stats = analysis.run_meta_cluster_clinical_analysis()
+
+    print("\nDiagnosis statistics:")
+    print(diag_stats[:5])
+
+    print("\nDemographic statistics:")
+    print(demo_stats[:5])
+
+    # ---------------------------
+    # Optional: Layer-2 permutation test
+    # ---------------------------
+    # true_mqe, null_mqe = analysis.cross_validated_permutation_test_layer2(
+    #     scaled, breadth, depth, n_splits=5, n_perms=20
+    # )
+    # analysis._plot_permutation_results(true_mqe, null_mqe)
+    # np.savetxt('Results/CV_LAYER2_TRUE_MQE.csv', true_mqe, delimiter=',')
+    # np.savetxt('Results/CV_LAYER2_NULL_MQE.csv', null_mqe, delimiter=',')
+    # logging.info('Layer 2 cross-validated permutation analysis completed successfully')
+
 
 if __name__ == '__main__':
     main()
