@@ -1,3 +1,4 @@
+
 import warnings
 
 
@@ -106,32 +107,46 @@ class SOMAnalysis:
         Path("Results").mkdir(exist_ok=True)
 
     def preprocess_data(self, only_cd: bool = True) -> pd.DataFrame:
-        # can change true to false
         """
-        Load, clean, harmonize, and scale the dataset. Returns a DataFrame ready for SOM training.
+        Load, clean, harmonize ONLY neurocognitive variables,
+        scale them, and return dataset for SOM.
+        Clinical variables remain raw and are never transformed.
         """
         try:
-            # Read raw data from fixed path
+            # -------------------------------
+            # Load dataset
+            # -------------------------------
             data_path = "/Users/adam/Desktop/CD_SOM2/CODE/Data/FemNAT_Neuro_psych_main.csv"
             df_raw = pd.read_csv(data_path)
             onset_series = df_raw['CD_OnsetType'].copy()
 
+            # -------------------------------
+            # PAL ZRE: combine age/gender-specific columns into one
+            # -------------------------------
+            pal_cols = [
+                "PAL_ZRE_1_9to12_girls",
+                "PAL_ZRE_1_9to12_boys",
+                "PAL_ZRE_1_13to15_girls",
+                "PAL_ZRE_1_13to15_boys",
+                "PAL_ZRE_1_16to18_girls",
+                "PAL_ZRE_1_16to18_boys"
+            ]
+
+            df_raw[pal_cols] = df_raw[pal_cols].replace(r"^\s*$", np.nan, regex=True)
+            df_raw[pal_cols] = df_raw[pal_cols].replace({0: np.nan, 1: np.nan})
+
+            df_raw["PAL"] = df_raw[pal_cols].apply(
+                lambda row: row.dropna().iloc[0] if row.dropna().size > 0 else np.nan,
+                axis=1
+            )
+
             # Keep original IDs
             ids = df_raw['ID'].astype(str)
 
-            # Rename columns
+            # -------------------------------
+            # Rename cognitive variables
+            # -------------------------------
             df_raw.rename(columns={
-                'CD_items_current_Aggression_sum': 'Aggression',
-                'CD_items_current_Destruction_sum': 'Destruction',
-                'CD_items_current_RuleViolation_sum': 'Rule Violation',
-                'CD_items_current_DeceitfulnessTheft_sum': 'Deceitfulness/Theft',
-                'ICU_IMPUTED_total_sum_imp': 'Callousness',
-               # 'ODD_items_fulfilled_current': 'ODD',
-                #'ADHD_current_Impulsivity_Hyperactivity_count': 'ADHD',
-                #'KSLDC_DIAG_Dep_acute': 'Depression',
-                #'KSLDC_DIAG_Anx_acute': 'Anxiety',
-                #'KSLDC_DIAG_PTSD_acute': 'PTSD',
-                #'KSLDC_DIAG_OCD_acute': 'OCD',
                 'Anger_ACC': 'Anger',
                 'Disgust_ACC': 'Disgust',
                 'Fear_ACC': 'Fear',
@@ -144,69 +159,50 @@ class SOMAnalysis:
                 'centre': 'centre'
             }, inplace=True)
 
-            # Core variables
+            # -------------------------------
+            # VARIABLES INCLUDED IN CLUSTERING
+            # (All neuropsych variables ONLY)
+            # -------------------------------
             selected_columns = [
-                'Aggression',
-                'Destruction',
-                'Rule Violation',
-                'Deceitfulness/Theft',
-                'Callousness',
-                #'ODD',
-                #'ADHD',
-                #'Depression',
-                #'Anxiety',
-                #'PTSD',
-                #'OCD',
-                'Anger',
-                'Disgust',
-                'Fear',
-                'Happiness',
-                'Sadness',
-                'Surprise',
+                'Anger', 'Disgust', 'Fear', 'Happiness',
+                'Sadness', 'Surprise',
                 'IQ',
-                'Sex',
-                'Age',
-                'centre'
+                'Sex', 'Age', 'centre',
+                'PAL'
             ]
 
-            # Coerce hit and false-alarm rates to numeric to avoid string entries
+            # Convert rates to numeric
             rate_cols = ['FArate_EmoControl_RES', 'HitRate_EmoControl_RES',
                          'FArate_CogControl_RES', 'HitRate_CogControl_RES']
+
             for col in rate_cols:
                 df_raw[col] = pd.to_numeric(df_raw[col], errors='coerce')
 
-            # d-prime helper
+            # d-prime
             from scipy.stats import norm
             def _compute_dprime(hit, fa, eps=1e-5):
                 hr = np.clip(hit, eps, 1 - eps)
                 fr = np.clip(fa, eps, 1 - eps)
                 return norm.ppf(hr) - norm.ppf(fr)
 
-            # Compute d-prime for control tasks
-            df_raw['dprime_EmoControl'] = _compute_dprime(
+            df_raw['Emotive Control'] = _compute_dprime(
                 df_raw['HitRate_EmoControl_RES'],
                 df_raw['FArate_EmoControl_RES']
             )
-            df_raw['dprime_CogControl'] = _compute_dprime(
+            df_raw['Cognitive Control'] = _compute_dprime(
                 df_raw['HitRate_CogControl_RES'],
                 df_raw['FArate_CogControl_RES']
-
             )
-
-            # Rename for clarity
-            df_raw.rename(columns={
-                'dprime_EmoControl': 'Emotive Control',
-                'dprime_CogControl': 'Cognitive Control'
-            }, inplace=True)
 
             selected_columns += ['Emotive Control', 'Cognitive Control']
 
-
-            # Subset and coerce
-            df_subset = df_raw[selected_columns].replace('', pd.NA)
+            # -------------------------------
+            # SUBSET cognitive variables ONLY
+            # -------------------------------
+            df_subset = df_raw[selected_columns].replace('', np.nan)
             df_subset = df_subset.apply(pd.to_numeric, errors='coerce')
 
-            # Drop constants and missing
+            # Drop constants & missing values
             df_subset = df_subset.loc[:, df_subset.nunique() > 1]
             df_subset = df_subset.dropna(subset=['Sex', 'centre']).dropna()
 
@@ -215,9 +211,12 @@ class SOMAnalysis:
             df_subset = df_subset.reset_index(drop=True)
             raw_age = df_subset['Age'].copy()
 
-            # Harmonize
-            covars = df_subset[['Sex', 'centre']].rename(columns={'Sex': 'gender', 'centre': 'batch'})
+            # -------------------------------
+            # Apply neuroCombat ONLY to neuropsych vars
+            # -------------------------------
+            covars = df_subset[['Sex', 'centre', 'Age']].rename(columns={'Sex': 'gender', 'centre': 'batch'})
             features = df_subset.drop(columns=['Sex', 'centre', 'Age'])
+
             if covars['gender'].nunique() > 1 and covars['batch'].nunique() > 1:
                 harmonized = neuroCombat(
                     dat=features.T,
@@ -230,35 +229,43 @@ class SOMAnalysis:
                 logging.warning("Skipping neuroCombat: insufficient variability")
                 df_harmonized = features
 
-            # Scale
+            # -------------------------------
+            # SCALE neuropsych variables ONLY
+            # -------------------------------
             scaler = StandardScaler()
             df_scaled = pd.DataFrame(
                 scaler.fit_transform(df_harmonized),
                 index=features.index, columns=features.columns
             ).clip(-3, 3)
 
-            # Final clean
+            # -------------------------------
+            # Assemble cleaned dataset
+            # -------------------------------
             df_clean_feat = df_scaled.reset_index(drop=True)
+
             df_clean = df_clean_feat.copy()
             df_clean.insert(0, 'ID', ids_subset)
             df_clean.insert(1, 'Sex', df_subset['Sex'])
             df_clean.insert(2, 'Age_raw', raw_age)
-            df_clean['Group'] = np.where(
-                df_clean['ID'].astype(int) <= 542, 'CD', 'Control'
-            )
+            df_clean['Group'] = np.where(df_clean['ID'].astype(int) <= 542, 'CD', 'Control')
 
-            # pull onset based on the same original rows you subsetted
             df_clean['CD_OnsetType'] = onset_series.iloc[df_subset.index].values
 
-            # now filter to CD-only if requested
             if only_cd:
                 df_clean = df_clean[df_clean['Group'] == 'CD']
 
-            # ---- build metadata with external clinical variables (NOT used in SOM) ----
+            # -------------------------------
+            # BUILD METADATA WITH RAW CLINICAL VARIABLES
+            # (No z-score, no Combat)
+            # -------------------------------
             meta = df_clean[['ID', 'Sex', 'Group', 'Age_raw', 'CD_OnsetType']].copy()
 
-            # pull diagnostic variables from the raw dataframe, aligned by ID
-            diag_cols = [
+            clinical_cols = [
+                'CD_items_current_Aggression_sum',
+                'CD_items_current_Destruction_sum',
+                'CD_items_current_RuleViolation_sum',
+                'CD_items_current_DeceitfulnessTheft_sum',
+                'ICU_IMPUTED_total_sum_imp',
                 'ODD_items_fulfilled_current',
                 'ADHD_current_Impulsivity_Hyperactivity_count',
                 'KSLDC_DIAG_Dep_acute',
@@ -266,28 +273,40 @@ class SOMAnalysis:
                 'KSLDC_DIAG_PTSD_acute',
                 'KSLDC_DIAG_OCD_acute'
             ]
-            diag_raw = df_raw[['ID'] + diag_cols].copy()
-            diag_raw['ID'] = diag_raw['ID'].astype(str)  # align with df_clean IDs
 
-            # merge into metadata
+            diag_raw = df_raw[['ID'] + clinical_cols].copy()
+            diag_raw['ID'] = diag_raw['ID'].astype(str)
+
+            for col in clinical_cols:
+                diag_raw[col] = pd.to_numeric(diag_raw[col], errors='coerce')
+
             meta = meta.merge(diag_raw, on='ID', how='left')
 
-            # rename to nice clinical names
             meta.rename(columns={
-                'ODD_items_fulfilled_current': 'ODD',
-                'ADHD_current_Impulsivity_Hyperactivity_count': 'ADHD',
+                'CD_items_current_Aggression_sum': 'Aggression',
+                'CD_items_current_Destruction_sum': 'Destruction',
+                'CD_items_current_RuleViolation_sum': 'Rule Violation',
+                'CD_items_current_DeceitfulnessTheft_sum': 'Deceitfulness/Theft',
+                'ICU_IMPUTED_total_sum_imp': 'Callousness',
                 'KSLDC_DIAG_Dep_acute': 'Depression',
                 'KSLDC_DIAG_Anx_acute': 'Anxiety',
                 'KSLDC_DIAG_PTSD_acute': 'PTSD',
                 'KSLDC_DIAG_OCD_acute': 'OCD',
+                'KSLDC_DIAG_ODD_acute':'ODD',
+                'KSLDC_DIAG_ADHD_acute': 'ADHD'
             }, inplace=True)
 
             self.df_metadata = meta
 
-            # Data used for SOM (no clinical/metadata columns)
+            # -------------------------------
+            # OUTPUT FOR CLUSTERING
+            # (Cognitive variables ONLY)
+            # -------------------------------
             df_to_return = df_clean.drop(columns=['Sex', 'Group', 'Age_raw', 'CD_OnsetType'])
+
             df_to_return.to_csv(
-                "/Users/adam/Desktop/CD_SOM2/CODE/Data/FemNAT_cleaned_encoded.csv", index=False
+                "/Users/adam/Desktop/CD_SOM2/CODE/Data/FemNAT_cleaned_encoded.csv",
+                index=False
             )
 
             # Plots
@@ -300,6 +319,7 @@ class SOMAnalysis:
         except Exception as e:
             logging.error(f"Error in preprocessing: {e}")
             raise
+
     def _plot_histograms(self, data: pd.DataFrame):
         plt.figure(figsize=(15,10))
         n = len(data.columns)
@@ -1098,46 +1118,50 @@ class SOMAnalysis:
             outpath="Results/MetaCluster_Clinical_Stats.xlsx"
     ):
         """
-        Produces two sheets:
+        Sheet 1: Diagnoses (categorical: ODD, ADHD, Depression, Anxiety, PTSD, OCD)
+                 → % per cluster, Chi-square, Cramer's V
 
-        Sheet 1: Diagnoses (ODD, ADHD, Depression, Anxiety, PTSD, OCD)
-            - % per cluster
-            - Chi-square
-            - p-value
-            - Cramer's V
+        Sheet 2: Continuous clinical variables (Aggression, Destruction, Callousness, Rule Violation)
+                 → Mean per cluster, ANOVA, eta2
 
-        Sheet 2: Demographics & clustering info
-            - Age_mean per cluster + ANOVA, p, eta2
-            - Sex % per cluster + chi-square, p, Cramer's V
-            - CD_OnsetType % per cluster + chi-square, p, Cramer's V
-            - N per cluster (no significance test)
+                 Demographics:
+                    - Age (mean + ANOVA)
+                    - Sex (%) + chi-square
+                    - CD Onset Type (%) + chi-square
+                    - N per cluster
         """
 
         df = self.build_meta_cluster_clinical_df()
 
-        # Diagnoses (categorical)
+        # -------------------------------
+        # Variables
+        # -------------------------------
         if cat_vars is None:
-            cat_vars = ["ODD", "ADHD", "Depression", "Anxiety", "PTSD", "OCD"]
+            cat_vars = [
+                "ODD", "ADHD", "Depression", "Anxiety", "PTSD", "OCD"
+            ]
 
-        # Table 2: Age + Sex + OnsetType (NO IQ)
+        # Continuous clinical variables
         if cont_vars is None:
-            cont_vars = ["Age_raw", "Sex", "CD_OnsetType"]
+            cont_vars = [
+                "Aggression", "Destruction", "Rule Violation",
+                "Deceitfulness/Theft", "Callousness", "Age_raw"
+            ]
 
         diag_rows = []
         demo_rows = []
 
         # ===========================
-        # N per cluster (simple count)
+        # N per cluster
         # ===========================
         cluster_sizes = df["MetaCluster"].value_counts().sort_index()
+        count_row = {"Variable": "N_per_cluster"}
         for cluster, count in cluster_sizes.items():
-            demo_rows.append({
-                "Variable": "N_per_cluster",
-                f"Cluster{cluster}": count
-            })
+            count_row[f"Cluster{cluster}"] = count
+        demo_rows.append(count_row)
 
         # ===========================
-        # 1. DIAGNOSES (categorical)
+        # 1. CATEGORICAL DIAGNOSES
         # ===========================
         for var in cat_vars:
             if var not in df.columns:
@@ -1146,8 +1170,7 @@ class SOMAnalysis:
             table = pd.crosstab(df["MetaCluster"], df[var])
             chi2, p, dof, expected = chi2_contingency(table)
 
-            # effect size
-            n = table.sum().sum()
+            n = table.to_numpy().sum()
             k = min(table.shape)
             cramers_v = np.sqrt(chi2 / (n * (k - 1))) if k > 1 else np.nan
 
@@ -1157,75 +1180,80 @@ class SOMAnalysis:
                 "Variable": var,
                 "Chi2": chi2,
                 "p": p,
-                "CramersV": cramers_v,
+                "CramersV": cramers_v
             }
 
-            # Add % per cluster
-            for cluster in pct.index:
-                # % of diagnosis present (value == 1)
-                row[f"Cluster{cluster}_%"] = pct.loc[cluster].get(1, 0)
+            # Percent with diagnosis (value = 1)
+            for clust in pct.index:
+                row[f"Cluster{clust}_%"] = pct.loc[clust].get(1, 0)
 
             diag_rows.append(row)
 
-        # ===================================
-        # 2. DEMOGRAPHICS & CONTINUOUS VARS
-        # ===================================
+        # ===========================
+        # 2. CONTINUOUS VARIABLES (clinical + age)
+        # ===========================
         for var in cont_vars:
             if var not in df.columns:
                 continue
 
-            # ------------------------------
-            # Continuous (AGE only)
-            # ------------------------------
-            if var == "Age_raw":  # continuous
-                groups = [g.dropna().values for _, g in df.groupby("MetaCluster")[var]]
-                F, p = f_oneway(*groups)
+            groups = [g.dropna().values for _, g in df.groupby("MetaCluster")[var]]
+            groups = [g for g in groups if len(g) > 0]
 
-                # effect size: eta squared
-                all_vals = df[var].dropna().values
-                grand_mean = all_vals.mean()
-                ss_between = sum(len(g) * (g.mean() - grand_mean) ** 2 for g in groups)
-                ss_total = ((all_vals - grand_mean) ** 2).sum()
-                eta2 = ss_between / ss_total if ss_total > 0 else np.nan
+            if len(groups) <= 1:
+                continue
 
-                means = df.groupby("MetaCluster")[var].mean()
+            # ANOVA
+            F, p = f_oneway(*groups)
 
-                row = {
-                    "Variable": var,
-                    "F": F,
-                    "p": p,
-                    "Eta2": eta2,
-                }
-                for cluster, m in means.items():
-                    row[f"Cluster{cluster}_Mean"] = round(m, 2)
+            # Eta-squared
+            all_vals = df[var].dropna().values
+            grand_mean = all_vals.mean()
+            ss_between = sum(len(g) * (g.mean() - grand_mean) ** 2 for g in groups)
+            ss_total = ((all_vals - grand_mean) ** 2).sum()
+            eta2 = ss_between / ss_total if ss_total > 0 else np.nan
 
-                demo_rows.append(row)
+            means = df.groupby("MetaCluster")[var].mean()
 
-            # -----------------------------------
-            # Sex + OnsetType (categorical)
-            # -----------------------------------
-            else:
-                table = pd.crosstab(df["MetaCluster"], df[var])
-                chi2, p, dof, expected = chi2_contingency(table)
+            row = {
+                "Variable": var,
+                "F": F,
+                "p": p,
+                "Eta2": eta2
+            }
 
-                n = table.sum().sum()
-                k = min(table.shape)
-                cramers_v = np.sqrt(chi2 / (n * (k - 1))) if k > 1 else np.nan
+            for cluster, mean_val in means.items():
+                row[f"Cluster{cluster}_Mean"] = round(mean_val, 2)
 
-                pct = (table.div(table.sum(axis=1), axis=0) * 100).round(1)
+            demo_rows.append(row)
 
-                row = {
-                    "Variable": var,
-                    "Chi2": chi2,
-                    "p": p,
-                    "CramersV": cramers_v
-                }
+        # ===========================
+        # 3. SEX + ONSET TYPE (categorical)
+        # ===========================
+        for var in ["Sex", "CD_OnsetType"]:
+            if var not in df.columns:
+                continue
 
-                # cluster percentages for first category
-                for cluster in pct.index:
-                    row[f"Cluster{cluster}_%"] = pct.loc[cluster].iloc[0]
+            table = pd.crosstab(df["MetaCluster"], df[var])
+            chi2, p, dof, expected = chi2_contingency(table)
 
-                demo_rows.append(row)
+            n = table.to_numpy().sum()
+            k = min(table.shape)
+            cramers_v = np.sqrt(chi2 / (n * (k - 1))) if k > 1 else np.nan
+
+            pct = (table.div(table.sum(axis=1), axis=0) * 100).round(1)
+
+            row = {
+                "Variable": var,
+                "Chi2": chi2,
+                "p": p,
+                "CramersV": cramers_v
+            }
+
+            # Use percentage of first category as representative
+            for cluster in pct.index:
+                row[f"Cluster{cluster}_%"] = pct.loc[cluster].iloc[0]
+
+            demo_rows.append(row)
 
         # ===========================
         # SAVE TO EXCEL
@@ -1233,7 +1261,7 @@ class SOMAnalysis:
         os.makedirs(os.path.dirname(outpath), exist_ok=True)
         with pd.ExcelWriter(outpath) as writer:
             pd.DataFrame(diag_rows).to_excel(writer, "Diagnoses", index=False)
-            pd.DataFrame(demo_rows).to_excel(writer, "Demographics", index=False)
+            pd.DataFrame(demo_rows).to_excel(writer, "Demographics_Continuous", index=False)
 
         logging.info(f"Clinical analysis written to {outpath}")
         return diag_rows, demo_rows
