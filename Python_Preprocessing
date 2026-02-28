@@ -1,0 +1,1247 @@
+import warnings
+
+
+warnings.filterwarnings('ignore')
+
+import os
+import logging
+from pathlib import Path
+from typing import Tuple, List, Dict, Any
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import networkx as nx
+import random
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.stats import norm
+from neuroCombat import neuroCombat
+from sklearn.metrics import silhouette_score
+from scipy.stats import chisquare
+from scipy.stats import chi2_contingency, f_oneway
+
+
+# ----------------------------------------------------------------
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('som_analysis.log'),
+        logging.StreamHandler()
+    ]
+)
+
+def compute_root_cluster_stability(
+    cv_path="Results/CV_RootCluster_Assignments.csv",
+    out_path="Results/CV_RootCluster_Stability.csv"
+):
+
+    df = pd.read_csv(cv_path)
+
+    rows = []
+
+    for sid, sub in df.groupby("ID"):
+
+        labs = sub["Root_Cluster"].dropna()
+        total = len(sub)
+
+        if len(labs) == 0:
+            stab = np.nan
+            common = None
+        else:
+            vals, cnts = np.unique(labs, return_counts=True)
+            common = vals[np.argmax(cnts)]
+            stab = cnts.max() / total
+
+        rows.append({
+            "ID": sid,
+            "MostCommon_Root": common,
+            "Stability": stab,
+            "NumRepeats": total,
+            "NumAssigned": len(labs)
+        })
+
+    out = pd.DataFrame(rows).sort_values("Stability", ascending=False)
+    out.to_csv(out_path, index=False)
+
+    print("\n=== Root-level stability ===")
+    print(out["Stability"].describe())
+
+    return out
+
+################################################################################
+class SOMAnalysis:
+    def __init__(self, data_dir: str = "Updated_DATA", n_jobs: int = None, seed: int = 42):
+        self.data_dir = Path(data_dir)
+        self.setup_directories()
+        self.n_jobs = n_jobs or os.cpu_count()
+        self.df_metadata: pd.DataFrame = pd.DataFrame()
+        self.seed = seed
+        np.random.seed(self.seed)
+        random.seed(seed)
+
+
+    def setup_directories(self):
+        Path("Layer2").mkdir(exist_ok=True)
+        Path("Results").mkdir(exist_ok=True)
+
+    def preprocess_data(self, only_cd: bool = True) -> pd.DataFrame:
+        """
+        Load, clean, and harmonize neurocognitive variables using neuroCombat.
+
+        Site effects are removed from neurocognitive features while preserving
+        biological variance associated with demographic and clinical covariates.
+
+        Clinical variables are not harmonized and are not used for clustering,
+        but are retained in metadata for downstream statistical analyses.
+        """
+
+        try:
+
+            # ============================================================
+            # LOAD DATA
+            # ============================================================
+
+            data_path = "/Users/adaml/Desktop/CODE/Data/FemNAT_Neuro_psych_main.csv"
+            df_raw = pd.read_csv(data_path)
+
+            ids = df_raw['ID'].astype(str)
+            onset_series = df_raw['CD_OnsetType']
+
+            # ============================================================
+            # PAL MERGE
+            # ============================================================
+
+            pal_cols = [
+                "PAL_ZRE_1_9to12_girls",
+                "PAL_ZRE_1_9to12_boys",
+                "PAL_ZRE_1_13to15_girls",
+                "PAL_ZRE_1_13to15_boys",
+                "PAL_ZRE_1_16to18_girls",
+                "PAL_ZRE_1_16to18_boys"
+            ]
+
+            df_raw[pal_cols] = df_raw[pal_cols].replace(r"^\s*$", np.nan, regex=True)
+            df_raw[pal_cols] = df_raw[pal_cols].replace({0: np.nan, 1: np.nan})
+
+            df_raw["PAL"] = df_raw[pal_cols].apply(
+                lambda row: row.dropna().iloc[0] if row.dropna().size > 0 else np.nan,
+                axis=1
+            )
+
+            # ============================================================
+            # RENAME COGNITIVE VARIABLES
+            # ============================================================
+
+            df_raw.rename(columns={
+                'Anger_ACC': 'Anger',
+                'Disgust_ACC': 'Disgust',
+                'Fear_ACC': 'Fear',
+                'Happy_ACC': 'Happiness',
+                'Sad_ACC': 'Sadness',
+                'Surprise_ACC': 'Surprise',
+                'eIQ_total': 'IQ'
+            }, inplace=True)
+
+            # ============================================================
+            # D-PRIME COMPUTATION
+            # ============================================================
+
+            rate_cols = [
+                'FArate_EmoControl_RES', 'HitRate_EmoControl_RES',
+                'FArate_CogControl_RES', 'HitRate_CogControl_RES'
+            ]
+
+            for col in rate_cols:
+                df_raw[col] = pd.to_numeric(df_raw[col], errors='coerce')
+
+            def _compute_dprime(hit, fa, eps=1e-5):
+                hr = np.clip(hit, eps, 1 - eps)
+                fr = np.clip(fa, eps, 1 - eps)
+                return norm.ppf(hr) - norm.ppf(fr)
+
+            df_raw['Emotive Control'] = _compute_dprime(
+                df_raw['HitRate_EmoControl_RES'],
+                df_raw['FArate_EmoControl_RES']
+            )
+
+            df_raw['Cognitive Control'] = _compute_dprime(
+                df_raw['HitRate_CogControl_RES'],
+                df_raw['FArate_CogControl_RES']
+            )
+
+            # ============================================================
+            # SELECT NEUROCOGNITIVE VARIABLES
+            # ============================================================
+
+            selected_columns = [
+                'Anger', 'Disgust', 'Fear', 'Happiness',
+                'Sadness', 'Surprise',
+                'Sex', 'Age', 'centre', 'IQ',
+                'PAL',
+                'Emotive Control', 'Cognitive Control'
+            ]
+
+            df_subset = df_raw[selected_columns].replace('', np.nan)
+            df_subset = df_subset.apply(pd.to_numeric, errors='coerce')
+
+            df_subset = df_subset.loc[:, df_subset.nunique() > 1]
+            df_subset = df_subset.dropna(subset=['Sex', 'centre']).dropna()
+
+            # Preserve IDs + onset
+            df_subset['ID'] = ids.loc[df_subset.index].values
+            df_subset['CD_OnsetType'] = onset_series.loc[df_subset.index].values
+
+            # ============================================================
+            # MERGE CLINICAL VARIABLES
+            # ============================================================
+
+            clinical_cols = [
+                'CD_items_current_Aggression_sum',
+                'CD_items_current_Destruction_sum',
+                'CD_items_current_RuleViolation_sum',
+                'CD_items_current_DeceitfulnessTheft_sum',
+                'ICU_IMPUTED_total_sum_imp',
+                'ODD_items_fulfilled_current',
+                'ADHD_current_Impulsivity_Hyperactivity_count',
+                'KSLDC_DIAG_Dep_acute',
+                'KSLDC_DIAG_Anx_acute',
+                'KSLDC_DIAG_PTSD_acute',
+                'KSLDC_DIAG_OCD_acute'
+            ]
+
+            clinical_df = df_raw[['ID'] + clinical_cols].copy()
+            clinical_df['ID'] = clinical_df['ID'].astype(str)
+
+            for col in clinical_cols:
+                clinical_df[col] = pd.to_numeric(clinical_df[col], errors='coerce')
+
+            # CD TOTAL
+            clinical_df['CD_total'] = clinical_df[
+                [
+                    'CD_items_current_Aggression_sum',
+                    'CD_items_current_Destruction_sum',
+                    'CD_items_current_RuleViolation_sum',
+                    'CD_items_current_DeceitfulnessTheft_sum'
+                ]
+            ].sum(axis=1, min_count=1)
+
+            df_subset = df_subset.merge(clinical_df, on='ID', how='left')
+
+            # ============================================================
+            # COMBAT COVARIATES (BIOLOGY PRESERVED)
+            # ============================================================
+
+            covars = df_subset[
+                [
+                    'Sex',
+                    'centre',
+                    'Age',
+                    'ICU_IMPUTED_total_sum_imp',
+                    'CD_total',
+                    'ADHD_current_Impulsivity_Hyperactivity_count',
+                    'ODD_items_fulfilled_current',
+                    'KSLDC_DIAG_Dep_acute',
+                    'KSLDC_DIAG_Anx_acute',
+                    'KSLDC_DIAG_PTSD_acute'
+                ]
+            ].rename(columns={
+                'Sex': 'gender',
+                'centre': 'batch',
+                'ICU_IMPUTED_total_sum_imp': 'ICU',
+                'ADHD_current_Impulsivity_Hyperactivity_count': 'ADHD',
+                'ODD_items_fulfilled_current': 'ODD',
+                'KSLDC_DIAG_Dep_acute': 'Depression',
+                'KSLDC_DIAG_Anx_acute': 'Anxiety',
+                'KSLDC_DIAG_PTSD_acute': 'PTSD'
+            })
+
+            covars = covars.dropna()
+            df_subset = df_subset.loc[covars.index]
+
+            logging.info(f"N after Combat covariate filtering: {len(df_subset)}")
+
+            # ============================================================
+            # FEATURES TO HARMONIZE (COGNITIVE ONLY)
+            # ============================================================
+
+            features = df_subset.drop(columns=[
+                'ID', 'CD_OnsetType',
+                'Sex', 'centre', 'Age', 'IQ',
+                'ICU_IMPUTED_total_sum_imp', 'CD_total',
+                'ADHD_current_Impulsivity_Hyperactivity_count',
+                'ODD_items_fulfilled_current',
+                'KSLDC_DIAG_Dep_acute',
+                'KSLDC_DIAG_Anx_acute',
+                'KSLDC_DIAG_PTSD_acute',
+                'KSLDC_DIAG_OCD_acute'
+            ])
+
+            # ============================================================
+            # RUN NEUROCOMBAT
+            # ============================================================
+
+            if covars['gender'].nunique() > 1 and covars['batch'].nunique() > 1:
+
+                combat_out = neuroCombat(
+                    dat=features.T,
+                    covars=covars,
+                    batch_col='batch',
+                    categorical_cols=['gender']
+                )
+
+                harmonized = combat_out["data"].T
+
+                df_harmonized = pd.DataFrame(
+                    harmonized,
+                    index=features.index,
+                    columns=features.columns
+                )
+
+            else:
+                logging.warning("Skipping neuroCombat: insufficient variability")
+                df_harmonized = features
+
+            # ============================================================
+            # SCALE FEATURES
+            # ============================================================
+
+            scaler = StandardScaler()
+
+            df_scaled = pd.DataFrame(
+                scaler.fit_transform(df_harmonized),
+                index=df_harmonized.index,
+                columns=df_harmonized.columns
+            ).clip(-3, 3)
+
+            # ============================================================
+            # BUILD METADATA
+            # ============================================================
+
+            meta_cols = [
+                'ID', 'Sex', 'Age', 'IQ',
+                'CD_total',
+                'ICU_IMPUTED_total_sum_imp',
+                'ADHD_current_Impulsivity_Hyperactivity_count',
+                'ODD_items_fulfilled_current',
+                'KSLDC_DIAG_Dep_acute',
+                'KSLDC_DIAG_Anx_acute',
+                'KSLDC_DIAG_PTSD_acute',
+                'KSLDC_DIAG_OCD_acute'
+            ]
+
+            meta = df_subset[meta_cols].copy()
+
+            meta.rename(columns={
+                'Age': 'Age_raw',
+                'ICU_IMPUTED_total_sum_imp': 'Callousness',
+                'KSLDC_DIAG_Dep_acute': 'Depression',
+                'KSLDC_DIAG_Anx_acute': 'Anxiety',
+                'KSLDC_DIAG_PTSD_acute': 'PTSD',
+                'KSLDC_DIAG_OCD_acute': 'OCD',
+                'ADHD_current_Impulsivity_Hyperactivity_count': 'ADHD',
+                'ODD_items_fulfilled_current': 'ODD'
+            }, inplace=True)
+
+            meta['Group'] = np.where(
+                meta['ID'].astype(int) <= 542,
+                'CD',
+                'Control'
+            )
+
+            meta['CD_OnsetType'] = df_subset['CD_OnsetType'].values
+
+            meta['Internalising_bin'] = np.where(
+                (meta['Anxiety'] == 1) | (meta['Depression'] == 1),
+                1,
+                np.where(
+                    meta[['Anxiety', 'Depression']].isna().any(axis=1),
+                    np.nan,
+                    0
+                )
+            )
+
+            self.df_metadata = meta
+
+            # ============================================================
+            # FINAL DATASET
+            # ============================================================
+
+            df_clean = df_scaled.copy()
+
+            df_clean.insert(0, 'ID', df_subset['ID'].values)
+
+            if only_cd:
+                df_clean = df_clean[df_clean['ID'].astype(int) <= 542]
+
+            df_clean.to_csv(
+                "/Users/adaml/Desktop/CODE/Data/FemNAT_cleaned_encoded.csv",
+                index=False
+            )
+
+            return df_clean
+
+        except Exception as e:
+            logging.error(f"Preprocessing failed: {e}")
+            raise
+
+    def _plot_histograms(self, data: pd.DataFrame):
+        plt.figure(figsize=(15,10))
+        n = len(data.columns)
+        for i, var in enumerate(data.columns, 1):
+            plt.subplot(2, int(np.ceil(n/2)), i)
+            plt.hist(data[var], bins=20)
+            plt.title(var)
+        plt.tight_layout()
+        plt.savefig('Results/variable_histograms.png')
+        plt.close()
+
+    def _plot_boxplots(self, data: pd.DataFrame):
+        plt.figure(figsize=(15,10))
+        n = len(data.columns)
+        for i, var in enumerate(data.columns, 1):
+            plt.subplot(2, int(np.ceil(n/2)), i)
+            plt.boxplot(data[var])
+            plt.title(var)
+        plt.tight_layout()
+        plt.savefig('Results/variable_boxplots.png')
+        plt.close()
+
+    def _plot_correlation_heatmap(self, data: pd.DataFrame):
+        corr = data.corr()
+        plt.figure(figsize=(12,10))
+        plt.imshow(corr, cmap='viridis', aspect='auto')
+        plt.colorbar()
+        plt.xticks(range(len(data.columns)), data.columns, rotation=45)
+        plt.yticks(range(len(data.columns)), data.columns)
+        plt.tight_layout()
+        plt.savefig('Results/correlation_heatmap.png')
+        plt.close()
+
+    def run_analysis(
+            self,
+            data: pd.DataFrame,
+            breadth: float,
+            depth: float,
+            bootsze: int = 100
+    ) -> Dict[str, Any]:
+
+        self.df_clean = data.copy()
+        logging.info(f"Using seed = {self.seed} for this run")
+
+        labels = data['ID'].values
+        features = data.drop(columns=['ID'], errors=True)
+
+        np.random.seed(self.seed)
+        struct = self.train_ghsom(features, breadth, depth, labels)
+        self.ghsom_struct = struct
+
+        root_cb = struct['root_map']['codebook']
+        root_bmus = struct['root_map']['bmus']
+
+        sil1 = silhouette_score(features.values, root_bmus)
+        self.silhouette_score = sil1
+
+        # Extract root clusters
+        l1 = self._extract_layer1_clusters(struct, labels)
+        self.l1_clusters = l1
+
+        # IMPORTANT: make this behave like old l2_clusters
+        self.root_clusters = l1
+
+        # permutation (root MQE)
+        true_mqe, null_mqe = self.cross_validated_permutation_test_root(
+            data=data,
+            breadth=breadth,
+            depth=depth,
+            n_splits=5,
+            n_perms=bootsze
+        )
+
+        self._plot_permutation_results(true_mqe, null_mqe)
+
+        self._plot_histograms(features)
+        self._plot_boxplots(features)
+        self._plot_correlation_heatmap(features)
+        self._plot_spider_profiles_layer1(features, l1)
+
+        self.export_ghsom_to_gexf(struct['root_map'], path='Results/ghsom_root.gexf')
+
+        return {
+            "ghsom_structure": struct,
+            "root_clusters": l1,
+            "silhouette_layer1": sil1,
+            "true_mqe": true_mqe,
+            "null_mqe": null_mqe
+        }
+
+    def _train_test_root_mqe(
+            self,
+            num_folds: int,
+            splits: List[Tuple[np.ndarray, np.ndarray]],
+            data: pd.DataFrame
+    ) -> List[float]:
+
+        mqes = []
+        root_cb = self.ghsom_struct['root_map']['codebook']
+
+        for tr_idx, te_idx in splits:
+            test = data.iloc[te_idx].values
+
+            for vec in test:
+                d2 = np.sum((root_cb - vec) ** 2, axis=1)
+                mqes.append(np.min(d2))
+
+        return mqes
+
+    def _compute_null_mqe_by_root_shuffle(
+            self,
+            num_folds: int,
+            splits: List[Tuple[np.ndarray, np.ndarray]],
+            data: pd.DataFrame,
+            seed_offset: int
+    ) -> List[float]:
+
+        null_mqe = []
+        root_cb = self.ghsom_struct['root_map']['codebook']
+
+        rng = np.random.RandomState(self.seed + seed_offset)
+        scrambled = data.copy().apply(
+            lambda col: rng.permutation(col.values), axis=0
+        )
+
+        for tr_idx, te_idx in splits:
+            test_scrambled = scrambled.iloc[te_idx].values
+
+            for vec in test_scrambled:
+                d2 = np.sum((root_cb - vec) ** 2, axis=1)
+                null_mqe.append(np.min(d2))
+
+        return null_mqe
+
+    def _run_permutation_analysis(
+            self,
+            data: pd.DataFrame,
+            bootsze: int
+    ) -> Dict[str, np.ndarray]:
+
+        num_folds, splits = self._create_folds(data)
+
+        true_mqe = self._train_test_root_mqe(num_folds, splits, data)
+
+        null_mqe = []
+        for i in range(bootsze):
+            null_mqe.extend(
+                self._compute_null_mqe_by_root_shuffle(
+                    num_folds, splits, data, seed_offset=i
+                )
+            )
+
+        return {
+            'perm_true_mqe': np.array(true_mqe),
+            'perm_null_mqe': np.array(null_mqe)
+        }
+
+    def cross_validated_mqe(self, data: pd.DataFrame, breadth: float, depth: float, n_splits: int = 5):
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.seed)
+        all_mqe = []
+
+        labels = data['ID'].values
+        features = data.drop(columns=['ID'], errors=True)
+
+        for fold_idx, (train_idx, test_idx) in enumerate(kf.split(features)):
+            X_train, X_test = features.iloc[train_idx], features.iloc[test_idx]
+            y_train, y_test = labels[train_idx], labels[test_idx]
+
+            # Train GHSOM on train fold
+            struct = self.train_ghsom(X_train, breadth, depth, y_train)
+            codebook = struct['root_map']['codebook']
+            root_cb = codebook
+
+            # For each test sample, calculate MQE to nearest codebook unit
+            for vec in X_test.values:
+                d2 = np.sum((root_cb - vec) ** 2, axis=1)
+                min_d2 = np.min(d2)
+                all_mqe.append(min_d2)
+
+            print(f"Fold {fold_idx + 1}/{n_splits} done.")
+
+        # Combine all MQEs from all folds
+        return np.array(all_mqe)
+
+    def cross_validated_permutation_test_root(
+            self,
+            data: pd.DataFrame,
+            breadth: float,
+            depth: float,
+            n_splits: int = 5,
+            n_perms: int = 100
+    ):
+
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=self.seed)
+
+        labels = data["ID"].values
+        features = data.drop(columns=["ID"], errors=True)
+
+        all_true_mqe = []
+        all_null_mqe = []
+
+        for fold_idx, (train_idx, test_idx) in enumerate(kf.split(features)):
+
+            X_train = features.iloc[train_idx]
+            X_test = features.iloc[test_idx]
+            y_train = labels[train_idx]
+
+            struct = self.train_ghsom(X_train, breadth, depth, y_train)
+            root_cb = struct["root_map"]["codebook"]
+
+            # TRUE MQE
+            for vec in X_test.values:
+                d2 = np.sum((root_cb - vec) ** 2, axis=1)
+                all_true_mqe.append(np.min(d2))
+
+            # NULL MQE
+            for _ in range(n_perms):
+                X_perm = X_test.apply(np.random.permutation, axis=0)
+                for vec in X_perm.values:
+                    d2 = np.sum((root_cb - vec) ** 2, axis=1)
+                    all_null_mqe.append(np.min(d2))
+
+            print(f"Fold {fold_idx + 1}/{n_splits} done.")
+
+        return np.array(all_true_mqe), np.array(all_null_mqe)
+
+    def cross_validated_root_clusters(
+            self,
+            data: pd.DataFrame,
+            breadth: float,
+            depth: float,
+            n_splits: int = 5,
+            n_repeats: int = 5
+    ) -> pd.DataFrame:
+        """
+        Cross-validated ROOT cluster assignments.
+        """
+
+        labels = data["ID"].values
+        features = data.drop(columns=["ID"], errors=True)
+
+        rows = []
+
+        for rep in range(n_repeats):
+
+            kf = KFold(
+                n_splits=n_splits,
+                shuffle=True,
+                random_state=self.seed + rep
+            )
+
+            for fold, (tr, te) in enumerate(kf.split(features), 1):
+
+                X_train = features.iloc[tr]
+                X_test = features.iloc[te]
+                y_train = labels[tr]
+                y_test = labels[te]
+
+                # Train GHSOM
+                struct = self.train_ghsom(X_train, breadth, depth, y_train)
+                root_cb = struct["root_map"]["codebook"]
+
+                # Assign test to ROOT BMU only
+                for sid, vec in zip(y_test, X_test.values):
+                    d2 = np.sum((root_cb - vec) ** 2, axis=1)
+                    root_label = int(np.argmin(d2))
+
+                    rows.append({
+                        "ID": sid,
+                        "Repeat": rep + 1,
+                        "Fold": fold,
+                        "Root_Cluster": root_label
+                    })
+
+                print(f"Repeat {rep + 1}, Fold {fold} done.")
+
+        df = pd.DataFrame(rows)
+        df.to_csv("Results/CV_RootCluster_Assignments.csv", index=False)
+
+        logging.info("Root CV assignments written.")
+        return df
+
+    def _plot_permutation_results(
+            self,
+            perm_true: np.ndarray,
+            perm_null: np.ndarray,
+            outpath = 'Results/perm_mqe_density.png'
+    ):
+        """
+        Plot filled histograms of true vs. null MQE, label their means,
+        and show a prominent p-value in the bottom-right.
+        """
+        mu_true = perm_true.mean()
+        mu_null = perm_null.mean()
+
+        # Compute one‐tailed p-value
+        p_val = np.mean(perm_null <= mu_true)
+
+        # Set up figure
+        plt.figure(figsize=(8, 6))
+
+        # Filled histograms
+        plt.hist(perm_null, bins=50, density=True, alpha=0.3,
+                 color='steelblue', label='Null MQE')
+        plt.hist(perm_true, bins=50, density=True, alpha=0.3,
+                 color='darkorange', label='True MQE')
+
+        ymin, ymax = plt.ylim()
+        xmin, xmax = plt.xlim()
+        label_ypos = ymax * 0.88
+        x_offset = (xmax - xmin) * 0.06
+        min_x = xmin + (xmax - xmin) * 0.13  # 13% of the width away from left
+
+        def draw_mean_line(mu, color, label, xoffset=0, align='center'):
+            plt.vlines(mu, ymin * 0.1, ymax * 0.9, colors=color,
+                       linestyles='--', linewidth=2)
+            x = mu + xoffset
+            # If label would collide with y-axis, bump right AND align left
+            if x < min_x:
+                x = min_x
+                align = 'left'
+            if x > xmax - (xmax - xmin) * 0.05:
+                x = mu - abs(xoffset)
+                align = 'right'
+            plt.text(x, label_ypos, f'{label}\n{mu:.2f}',
+                     ha=align, va='bottom', color=color,
+                     fontsize=13, fontweight='bold',
+                     backgroundcolor='white', alpha=0.92, zorder=10)
+
+        # True mean left, Null mean right, both at safe y-height and with large enough offset
+        draw_mean_line(mu_true, 'darkorange', 'True mean', xoffset=-x_offset, align='right')
+        draw_mean_line(mu_null, 'steelblue', 'Null mean', xoffset=+x_offset, align='left')
+        # p-value in bottom-right
+        plt.text(
+            0.95, 0.05, f'p = {p_val:.3f}',
+            transform=plt.gca().transAxes,
+            ha='right', va='bottom',
+            fontsize=12, fontweight='bold',
+            bbox=dict(boxstyle='round', facecolor='white',
+                      edgecolor='gray', alpha=0.8)
+        )
+
+        # Labels & legend
+        plt.xlabel('Quantization Error (squared)')
+        plt.ylabel('Density')
+        plt.title('Permutation Test: MQE Distributions')
+        plt.legend(loc='upper right')
+        plt.tight_layout()
+        plt.savefig(outpath, dpi=150)
+        plt.close()
+
+    def _create_folds(self, data: pd.DataFrame) -> Tuple[int, List[Tuple[np.ndarray, np.ndarray]]]:
+        kf = KFold(n_splits=5, shuffle=True, random_state=42)
+        return 5, list(kf.split(data))
+
+    def export_ghsom_to_gexf(
+            self,
+            ghsom_root,
+            path: str = "Results/ghsom_force.gexf",
+            layout_scale: float = 1.0
+    ):
+        """
+        Export a GHSOM hierarchy to a GEXF graph using a Fruchterman–Reingold layout.
+
+        :param ghsom_root: nested dict representing the GHSOM hierarchy
+        :param path: output path for the GEXF file
+        :param layout_scale: scaling factor for the force-directed layout
+        """
+        # 1. Build the directed hierarchy
+        G = nx.DiGraph()
+
+        def traverse(node, name="root", depth=0, group=None):
+            # Group name is the top-level cluster identifier
+            group = name if depth == 1 else group
+            rows, cols = node['topol']['msize']
+            G.add_node(
+                name,
+                label=f"{name} [{rows}×{cols}]",
+                level=depth,
+                parent_group=group or "root"
+            )
+            for idx, child in enumerate(node.get('children', [])):
+                if child is None:
+                    continue
+                child_name = f"{name}.{idx}"
+                G.add_edge(name, child_name)
+                traverse(child, child_name, depth + 1, group)
+
+        traverse(ghsom_root)
+
+        # 2. Compute force-directed positions using Fruchterman-Reingold
+        #    'scale' controls the overall spread of the layout
+        positions = nx.spring_layout(G, scale=layout_scale)
+
+        # 3. Write positions into the graph as x,y attributes
+        for node, (x, y) in positions.items():
+            G.nodes[node]['x'] = float(x)
+            G.nodes[node]['y'] = float(y)
+
+        # 4. Export to GEXF
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        nx.write_gexf(G, path)
+        print(f"Exported GHSOM with force-directed layout to {path}")
+
+    def train_ghsom(
+            self,
+            data: pd.DataFrame,
+            breadth: float,
+            depth: float,
+            labels: np.ndarray
+    ) -> Dict[str, Any]:
+
+        import matlab.engine
+        from scipy.io import loadmat
+
+        logging.info("Starting MATLAB (your) ghsom_train...")
+
+        # -------------------------------------------
+        # Start MATLAB
+        # -------------------------------------------
+        eng = matlab.engine.start_matlab()
+
+        # Add toolboxes
+        eng.eval("addpath(genpath('C:/Users/adaml/Desktop/CODE/somtoolbox_1'))", nargout=0)
+        eng.eval("addpath(genpath('C:/Users/adaml/Desktop/CODE/somtoolbox_2'))", nargout=0)
+        eng.eval("addpath(genpath('C:/Users/adaml/Desktop/CODE/MATLAB_GHSOM'))", nargout=0)
+
+        # Set seed
+        eng.eval(f"rng({self.seed});", nargout=0)
+
+        # Push data into MATLAB workspace
+        eng.workspace['X'] = matlab.double(data.astype(float).values.tolist())
+
+        # 🚀 IMPORTANT: assign outputs explicitly inside MATLAB
+        eng.eval(f"""
+        [ghMap, ghTrain] = ghsom_train(X, ...
+            'breadth', {breadth}, ...
+            'depth', {depth}, ...
+            'tracking', 1);
+        """, nargout=0)
+
+        # Now ghMap EXISTS in MATLAB workspace
+        eng.eval("save('Results/ghsom_output.mat','ghMap','ghTrain')", nargout=0)
+
+        eng.quit()
+
+        # -------------------------------------------
+        # Load MATLAB struct
+        # -------------------------------------------
+        mat = loadmat(
+            "Results/ghsom_output.mat",
+            squeeze_me=True,
+            struct_as_record=False
+        )
+
+        ghMap = mat["ghMap"]
+
+        # Convert to Python structure
+        struct = {
+            "root_map": self._convert_matlab_ghmap(ghMap, data.values)
+        }
+
+        self._save_ghsom_results(struct)
+
+        return struct
+
+    def _convert_matlab_ghmap(self, ghMap, X):
+
+        """
+        Properly reconstruct MATLAB GHSOM hierarchy using:
+            ghMap.parent
+            ghMap.parent_unit
+            ghMap.layer
+        """
+
+        # -----------------------------
+        # Normalize MATLAB cell arrays
+        # -----------------------------
+        sMap = ghMap.sMap
+        parent = ghMap.parent
+        parent_unit = ghMap.parent_unit
+        layer = ghMap.layer
+
+        # Convert to Python lists if needed
+        if not isinstance(sMap, (list, np.ndarray)):
+            sMap = [sMap]
+        if isinstance(sMap, np.ndarray):
+            sMap = list(sMap.flatten())
+
+        parent = np.array(parent).flatten()
+        parent_unit = np.array(parent_unit).flatten()
+        layer = np.array(layer).flatten()
+
+        # -----------------------------
+        # Root map (MATLAB index 1)
+        # -----------------------------
+        # Find true root
+        root_idx = np.where(parent == 0)[0][0]
+        root_sMap = sMap[root_idx]
+
+        root_codebook = np.array(root_sMap.codebook)
+        n_root_units = root_codebook.shape[0]
+
+        # Compute BMUs
+        d2_root = np.sum((X[:, None, :] - root_codebook[None, :, :]) ** 2, axis=2)
+        root_bmus = np.argmin(d2_root, axis=1)
+
+        # Build children list
+        children = [None] * n_root_units
+
+        for i in range(len(sMap)):
+
+            if i == root_idx:
+                continue
+
+            if layer[i] != 2:
+                continue
+
+            # Must be child of actual root
+            if parent[i] != (root_idx + 1):
+                continue
+
+            root_unit_index = int(parent_unit[i]) - 1
+
+            child_map = sMap[i]
+
+            children[root_unit_index] = {
+                "codebook": np.array(child_map.codebook),
+                "topol": {
+                    "msize": tuple(child_map.topol.msize)
+                }
+            }
+
+        # -----------------------------
+        # Final root structure
+        # -----------------------------
+        root_struct = {
+            "codebook": root_codebook,
+            "bmus": root_bmus,
+            "children": children,
+            "topol": {
+                "msize": tuple(root_sMap.topol.msize)
+            }
+        }
+
+        return root_struct
+
+    def _extract_layer1_clusters(
+            self,
+            struct: Dict[str, Any],
+            labels: np.ndarray
+    ) -> Dict[int, List[str]]:
+
+        clusters = {}
+
+        root_bmus = struct['root_map']['bmus']
+
+        for unit in np.unique(root_bmus):
+            ids = labels[root_bmus == unit]
+            clusters[int(unit)] = ids.tolist()
+
+        return clusters
+
+    def build_root_cluster_clinical_df(self) -> pd.DataFrame:
+        """
+        Merge root cluster assignments with clinical metadata and SOM features.
+        Returns a DataFrame with:
+          ID, Root_Cluster, clinical vars, and SOM feature vars.
+        """
+
+        if not hasattr(self, "l1_clusters"):
+            raise RuntimeError("Run run_analysis() first.")
+
+        rows = []
+        for unit, ids in self.l1_clusters.items():
+            for sid in ids:
+                rows.append({
+                    "ID": sid,
+                    "Root_Cluster": int(unit)
+                })
+
+        df_assign = pd.DataFrame(rows)
+
+        df = (
+            df_assign
+            .merge(self.df_metadata, on="ID", how="left")
+            .merge(self.df_clean, on="ID", how="left")
+        )
+
+        return df
+
+    def compare_root_clusters_categorical(
+            self,
+            df: pd.DataFrame,
+            variable: str
+    ):
+        """
+        Chi-square + Cramér's V for a categorical clinical variable vs Root_Cluster.
+        """
+
+        table = pd.crosstab(df["Root_Cluster"], df[variable])
+
+        if table.size == 0 or table.to_numpy().sum() == 0:
+            logging.warning(f"No data for categorical variable '{variable}'.")
+            return None
+
+        chi2, p, dof, expected = chi2_contingency(table)
+
+        n = table.to_numpy().sum()
+        k = min(table.shape)
+        cramers_v = np.sqrt(chi2 / (n * (k - 1))) if k > 1 else np.nan
+
+        logging.info(
+            f"[Categorical] {variable}: chi2={chi2:.2f}, p={p:.4f}, "
+            f"Cramér's V={cramers_v:.3f}"
+        )
+
+        return {
+            "variable": variable,
+            "chi2": chi2,
+            "p": p,
+            "cramers_v": cramers_v,
+            "table": table
+        }
+
+    def run_root_cluster_clinical_analysis(
+            self,
+            outpath="Results/Root_Clinical_Stats.xlsx"
+    ):
+
+        if not hasattr(self, "l1_clusters"):
+            raise RuntimeError("Run run_analysis() first")
+
+        rows = []
+        for unit, ids in self.l1_clusters.items():
+            for sid in ids:
+                rows.append({
+                    "ID": sid,
+                    "Root_Cluster": int(unit)
+                })
+
+        df_assign = pd.DataFrame(rows)
+
+        df = (
+            df_assign
+            .merge(self.df_metadata, on="ID", how="left")
+            .merge(self.df_clean, on="ID", how="left")
+        )
+
+        cat_vars = ["ODD", "ADHD", "Depression", "Anxiety", "PTSD", "OCD"]
+        cont_vars = ["CD_total", "Callousness", "Age_raw"]
+
+        diag_rows, cont_rows = [], []
+
+        # CATEGORICAL (same as before)
+        for var in cat_vars:
+            table = pd.crosstab(df["Root_Cluster"], df[var])
+            chi2, p, _, _ = chi2_contingency(table)
+
+            n = table.values.sum()
+            k = min(table.shape)
+            V = np.sqrt(chi2 / (n * (k - 1))) if k > 1 else np.nan
+
+            row = {"Variable": var, "Chi2": chi2, "p": p, "CramersV": V}
+            for cl in table.index:
+                row[f"{cl}_%"] = (
+                        table.loc[cl].get(1, 0) / table.loc[cl].sum() * 100
+                )
+            diag_rows.append(row)
+
+        # CONTINUOUS (same as before)
+        for var in cont_vars:
+            groups = [
+                g.dropna().values
+                for _, g in df.groupby("Root_Cluster")[var]
+                if len(g.dropna()) > 0
+            ]
+
+            if len(groups) < 2:
+                continue
+
+            F, p = f_oneway(*groups)
+
+            all_vals = df[var].dropna().values
+            gm = all_vals.mean()
+            ssb = sum(len(g) * (g.mean() - gm) ** 2 for g in groups)
+            sst = ((all_vals - gm) ** 2).sum()
+            eta2 = ssb / sst if sst > 0 else np.nan
+
+            row = {"Variable": var, "F": F, "p": p, "Eta2": eta2}
+
+            for cl, mean in df.groupby("Root_Cluster")[var].mean().items():
+                row[f"{cl}_Mean"] = mean
+
+            cont_rows.append(row)
+
+        with pd.ExcelWriter(outpath) as w:
+            pd.DataFrame(diag_rows).to_excel(w, "Categorical", index=False)
+            pd.DataFrame(cont_rows).to_excel(w, "Continuous", index=False)
+
+        logging.info(f"Root clinical analysis written  {outpath}")
+
+    def write_root_cluster_summary(
+            self,
+            outpath="Results/Root_Cluster_Summary.xlsx"
+    ):
+
+        if not hasattr(self, "l1_clusters"):
+            raise RuntimeError("Run run_analysis() first")
+
+        rows = []
+        for unit, ids in self.l1_clusters.items():
+            for sid in ids:
+                rows.append({
+                    "ID": sid,
+                    "Root_Cluster": int(unit)
+                })
+
+        df_assign = pd.DataFrame(rows)
+
+        df = (
+            df_assign
+            .merge(self.df_metadata, on="ID", how="left")
+            .merge(self.df_clean, on="ID", how="left")
+        )
+
+        neuropsych_vars = [
+            c for c in self.df_clean.columns
+            if c not in ["ID", "IQ"]
+        ]
+
+        clinical_vars = [
+            "CD_total", "Callousness", "ODD", "ADHD",
+            "Depression", "Anxiety", "PTSD", "OCD",
+            "Internalising_bin"
+        ]
+
+        summary_rows = []
+
+        for clust, sub in df.groupby("Root_Cluster"):
+
+            row = {"Cluster": clust, "N": len(sub)}
+
+            for var in neuropsych_vars:
+                row[f"Mean_{var}"] = sub[var].mean()
+
+            for var in clinical_vars:
+                if var not in sub.columns:
+                    continue
+
+                if sub[var].dropna().isin([0, 1]).all():
+                    row[f"{var}_%"] = sub[var].mean() * 100
+                else:
+                    row[f"Mean_{var}"] = sub[var].mean()
+
+            row["Mean_Age"] = sub["Age_raw"].mean()
+            row["Mean_IQ"] = sub["IQ"].mean()
+
+            sex_counts = sub["Sex"].value_counts(normalize=True) * 100
+            row["Male_%"] = sex_counts.get(2, 0)
+            row["Female_%"] = sex_counts.get(1, 0)
+
+            summary_rows.append(row)
+
+        summary_df = pd.DataFrame(summary_rows)
+        summary_df.to_excel(outpath, index=False)
+
+        logging.info(f"Root cluster summary written  {outpath}")
+        return summary_df
+
+    def _plot_spider_profiles_layer1(
+            self,
+            features: pd.DataFrame,
+            clusters: Dict[int, List[str]]
+    ):
+
+        id2idx = {id_: i for i, id_ in enumerate(self.df_clean['ID'])}
+
+        cols = features.columns.tolist()
+        N = len(cols)
+        angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+        angles += angles[:1]
+
+        for unit, ids in clusters.items():
+
+            idxs = [id2idx[i] for i in ids if i in id2idx]
+
+            if len(idxs) < 2:
+                continue
+
+            vals = features.iloc[idxs].mean(axis=0).tolist()
+            vals += vals[:1]
+
+            fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={'polar': True})
+
+            ax.plot(angles, vals, linewidth=2)
+            ax.fill(angles, vals, alpha=0.25)
+
+            ax.set_thetagrids(np.degrees(angles[:-1]), cols, fontsize=8)
+            ax.set_ylim(-2, 3)
+            ax.set_yticks([-2, 0, 2])
+            ax.set_title(f"Root Cluster {unit}", y=1.1)
+
+            outfile = f"Results/spider_L1_{unit}.png"
+            plt.savefig(outfile, bbox_inches="tight", dpi=150)
+            plt.close()
+
+            print(f"Saved: {outfile}")
+
+    def _save_ghsom_results(self, struct: Dict[str, Any]):
+        np.savetxt('Layer2/NWT_V1.csv', struct['root_map']['codebook'], delimiter=',')
+        np.savetxt('Layer2/DPP_V1.csv', np.ones(len(struct['root_map']['codebook'])), delimiter=',')
+        np.save('Results/GHSOM_Struct.npy', struct)
+
+
+def main():
+
+    analysis = SOMAnalysis()
+
+    scaled = analysis.preprocess_data(only_cd=True)
+
+    breadth = 0.9
+    depth = 1
+
+    # ---------------------------
+    # ROOT GHSOM Analysis
+    # ---------------------------
+    results = analysis.run_analysis(
+        data=scaled,
+        breadth=breadth,
+        depth=depth,
+        bootsze=100
+    )
+
+    # Cross-validated ROOT clusters
+    df_cv = analysis.cross_validated_root_clusters(
+        data=scaled,
+        breadth=breadth,
+        depth=depth,
+        n_splits=5,
+        n_repeats=5
+    )
+
+    df_stab = compute_root_cluster_stability()
+
+    analysis.run_root_cluster_clinical_analysis()
+    analysis.write_root_cluster_summary()
+    print("\nFirst few stability rows:")
+    print(df_stab.head())
+
+    # ---------------------------
+    # Clinical comparison
+    # ---------------------------
+    analysis.run_root_cluster_clinical_analysis()
+
+
+if __name__ == '__main__':
+    main()
