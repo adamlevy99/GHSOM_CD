@@ -1,0 +1,1882 @@
+import warnings
+
+
+warnings.filterwarnings('ignore')
+
+import matplotlib
+matplotlib.use("Agg")
+
+
+import os
+import logging
+from pathlib import Path
+from typing import Tuple, List, Dict, Any
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import networkx as nx
+import random
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import norm
+from neuroCombat import neuroCombat
+from scipy.stats import chi2_contingency, f_oneway
+from sklearn.metrics import adjusted_rand_score
+import umap.umap_ as umap
+
+
+# ----------------------------------------------------------------
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('som_analysis.log'),
+        logging.StreamHandler()
+    ]
+)
+
+
+
+################################################################################
+class SOMAnalysis:
+    def __init__(self, data_dir: str = "Updated_DATA", n_jobs: int = None, seed: int = 42):
+        self.data_dir = Path(data_dir)
+        self.setup_directories()
+        self.n_jobs = n_jobs or os.cpu_count()
+        self.df_metadata: pd.DataFrame = pd.DataFrame()
+        self.seed = seed
+        np.random.seed(self.seed)
+        random.seed(seed)
+
+
+    def setup_directories(self):
+        Path("Layer2").mkdir(exist_ok=True)
+        Path("Results").mkdir(exist_ok=True)
+
+    def preprocess_data(
+            self,
+            only_cd: bool = True,
+            site_normalization: bool = True
+    ) -> pd.DataFrame:
+        """
+        Load, clean, and harmonize neurocognitive variables using neuroCombat.
+
+        Site effects are removed from neurocognitive features while preserving
+        biological variance associated with demographic and clinical covariates.
+
+        Clinical variables are not harmonized and are not used for clustering,
+        but are retained in metadata for downstream statistical analyses.
+        """
+
+        try:
+
+            # ============================================================
+            # LOAD DATA
+            # ============================================================
+
+            data_path = "/Users/adaml/Desktop/CODE/Data/FemNAT_Neuro_psych_main.csv"
+            df_raw = pd.read_csv(data_path)
+
+            ids = df_raw['ID'].astype(str)
+            onset_series = df_raw['CD_OnsetType']
+
+            # ============================================================
+            # PAL MERGE
+            # ============================================================
+
+            pal_cols = [
+                "PAL_ZRE_1_9to12_girls",
+                "PAL_ZRE_1_9to12_boys",
+                "PAL_ZRE_1_13to15_girls",
+                "PAL_ZRE_1_13to15_boys",
+                "PAL_ZRE_1_16to18_girls",
+                "PAL_ZRE_1_16to18_boys"
+            ]
+
+            df_raw[pal_cols] = df_raw[pal_cols].replace(r"^\s*$", np.nan, regex=True)
+            df_raw[pal_cols] = df_raw[pal_cols].replace({0: np.nan, 1: np.nan})
+
+            df_raw["PAL"] = df_raw[pal_cols].apply(
+                lambda row: row.dropna().iloc[0] if row.dropna().size > 0 else np.nan,
+                axis=1
+            )
+
+            # ============================================================
+            # RENAME COGNITIVE VARIABLES
+            # ============================================================
+
+            df_raw.rename(columns={
+                'Anger_ACC': 'Anger',
+                'Disgust_ACC': 'Disgust',
+                'Fear_ACC': 'Fear',
+                'Happy_ACC': 'Happiness',
+                'Sad_ACC': 'Sadness',
+                'Surprise_ACC': 'Surprise',
+                'eIQ_total': 'IQ'
+            }, inplace=True)
+
+            # ============================================================
+            # D-PRIME COMPUTATION
+            # ============================================================
+
+            rate_cols = [
+                'FArate_EmoControl_RES', 'HitRate_EmoControl_RES',
+                'FArate_CogControl_RES', 'HitRate_CogControl_RES'
+            ]
+
+            for col in rate_cols:
+                df_raw[col] = pd.to_numeric(df_raw[col], errors='coerce')
+
+            def _compute_dprime(hit, fa, eps=1e-5):
+                hr = np.clip(hit, eps, 1 - eps)
+                fr = np.clip(fa, eps, 1 - eps)
+                return norm.ppf(hr) - norm.ppf(fr)
+
+            df_raw['Emotive Control'] = _compute_dprime(
+                df_raw['HitRate_EmoControl_RES'],
+                df_raw['FArate_EmoControl_RES']
+            )
+
+            df_raw['Cognitive Control'] = _compute_dprime(
+                df_raw['HitRate_CogControl_RES'],
+                df_raw['FArate_CogControl_RES']
+            )
+
+            # ============================================================
+            # SELECT NEUROCOGNITIVE VARIABLES
+            # ============================================================
+
+            selected_columns = [
+                'Anger', 'Disgust', 'Fear', 'Happiness',
+                'Sadness', 'Surprise',
+                'Sex', 'Age', 'centre', 'IQ',
+                'PAL',
+                'Emotive Control', 'Cognitive Control'
+            ]
+
+            df_subset = df_raw[selected_columns].replace('', np.nan)
+            df_subset = df_subset.apply(pd.to_numeric, errors='coerce')
+
+            df_subset = df_subset.loc[:, df_subset.nunique() > 1]
+            df_subset = df_subset.dropna(subset=['Sex', 'centre']).dropna()
+
+            # Preserve IDs + onset
+            df_subset['ID'] = ids.loc[df_subset.index].values
+            df_subset['CD_OnsetType'] = onset_series.loc[df_subset.index].values
+
+            # ============================================================
+            # MERGE CLINICAL VARIABLES
+            # ============================================================
+
+            clinical_cols = [
+                'CD_items_current_Aggression_sum',
+                'CD_items_current_Destruction_sum',
+                'CD_items_current_RuleViolation_sum',
+                'CD_items_current_DeceitfulnessTheft_sum',
+                'ICU_IMPUTED_total_sum_imp',
+                'ODD_items_fulfilled_current',
+                'ADHD_current_Impulsivity_Hyperactivity_count',
+                'KSLDC_DIAG_Dep_acute',
+                'KSLDC_DIAG_Anx_acute',
+                'KSLDC_DIAG_PTSD_acute',
+                'KSLDC_DIAG_OCD_acute'
+            ]
+
+            clinical_df = df_raw[['ID'] + clinical_cols].copy()
+            clinical_df['ID'] = clinical_df['ID'].astype(str)
+
+            for col in clinical_cols:
+                clinical_df[col] = pd.to_numeric(clinical_df[col], errors='coerce')
+
+            # CD TOTAL
+            clinical_df['CD_total'] = clinical_df[
+                [
+                    'CD_items_current_Aggression_sum',
+                    'CD_items_current_Destruction_sum',
+                    'CD_items_current_RuleViolation_sum',
+                    'CD_items_current_DeceitfulnessTheft_sum'
+                ]
+            ].sum(axis=1, min_count=1)
+
+            df_subset = df_subset.merge(clinical_df, on='ID', how='left')
+
+            # ============================================================
+            # COMBAT COVARIATES (BIOLOGY PRESERVED)
+            # ============================================================
+
+            covars = df_subset[
+                [
+                    'Sex',
+                    'centre',
+                    'Age',
+                    'ICU_IMPUTED_total_sum_imp',
+                    'CD_total',
+                    'ADHD_current_Impulsivity_Hyperactivity_count',
+                    'ODD_items_fulfilled_current',
+                    'KSLDC_DIAG_Dep_acute',
+                    'KSLDC_DIAG_Anx_acute',
+                    'KSLDC_DIAG_PTSD_acute'
+                ]
+            ].rename(columns={
+                'Sex': 'gender',
+                'centre': 'batch',
+                'ICU_IMPUTED_total_sum_imp': 'ICU',
+                'ADHD_current_Impulsivity_Hyperactivity_count': 'ADHD',
+                'ODD_items_fulfilled_current': 'ODD',
+                'KSLDC_DIAG_Dep_acute': 'Depression',
+                'KSLDC_DIAG_Anx_acute': 'Anxiety',
+                'KSLDC_DIAG_PTSD_acute': 'PTSD'
+            })
+
+            covars = covars.dropna()
+            df_subset = df_subset.loc[covars.index]
+
+            logging.info(f"N after Combat covariate filtering: {len(df_subset)}")
+
+            # ============================================================
+            # FEATURES TO HARMONIZE (COGNITIVE ONLY)
+            # ============================================================
+
+            features = df_subset.drop(columns=[
+                'ID', 'CD_OnsetType',
+                'Sex', 'centre', 'Age', 'IQ',
+                'ICU_IMPUTED_total_sum_imp', 'CD_total',
+                'ADHD_current_Impulsivity_Hyperactivity_count',
+                'ODD_items_fulfilled_current',
+                'KSLDC_DIAG_Dep_acute',
+                'KSLDC_DIAG_Anx_acute',
+                'KSLDC_DIAG_PTSD_acute',
+                'KSLDC_DIAG_OCD_acute'
+            ])
+
+            # ============================================================
+            # RUN NEUROCOMBAT
+            # ============================================================
+
+            if site_normalization:
+                if covars['gender'].nunique() > 1 and covars['batch'].nunique() > 1:
+
+                    logging.info("Running neuroCombat (site normalization ON)")
+
+                    combat_out = neuroCombat(
+                        dat=features.T,
+                        covars=covars,
+                        batch_col='batch',
+                        categorical_cols=['gender']
+                    )
+
+                    harmonized = combat_out["data"].T
+
+                    df_harmonized = pd.DataFrame(
+                        harmonized,
+                        index=features.index,
+                        columns=features.columns
+                    )
+
+                else:
+                    logging.warning("Skipping neuroCombat: insufficient variability")
+                    df_harmonized = features
+
+            else:
+                logging.info("Site normalization OFF — using raw features")
+                df_harmonized = features
+
+            # ============================================================
+            # SCALE FEATURES
+            # ============================================================
+
+            scaler = StandardScaler()
+
+            df_scaled = pd.DataFrame(
+                scaler.fit_transform(df_harmonized),
+                index=df_harmonized.index,
+                columns=df_harmonized.columns
+            ).clip(-3, 3)
+
+            # ============================================================
+            # BUILD METADATA
+            # ============================================================
+
+            meta_cols = [
+                'ID', 'Sex', 'Age', 'IQ',
+                'CD_total',
+                'ICU_IMPUTED_total_sum_imp',
+                'ADHD_current_Impulsivity_Hyperactivity_count',
+                'ODD_items_fulfilled_current',
+                'KSLDC_DIAG_Dep_acute',
+                'KSLDC_DIAG_Anx_acute',
+                'KSLDC_DIAG_PTSD_acute',
+                'KSLDC_DIAG_OCD_acute'
+            ]
+
+            meta = df_subset[meta_cols].copy()
+
+            meta.rename(columns={
+                'ICU_IMPUTED_total_sum_imp': 'Callousness',
+                'KSLDC_DIAG_Dep_acute': 'Depression',
+                'KSLDC_DIAG_Anx_acute': 'Anxiety',
+                'KSLDC_DIAG_PTSD_acute': 'PTSD',
+                'KSLDC_DIAG_OCD_acute': 'OCD',
+                'ADHD_current_Impulsivity_Hyperactivity_count': 'ADHD',
+                'ODD_items_fulfilled_current': 'ODD'
+            }, inplace=True)
+
+            meta['Group'] = np.where(
+                pd.to_numeric(meta['ID'], errors='coerce') <= 542,
+                'CD',
+                'Control'
+            )
+
+            meta['CD_OnsetType'] = df_subset['CD_OnsetType'].values
+
+            meta['Internalising_bin'] = np.where(
+                (meta['Anxiety'] == 1) | (meta['Depression'] == 1),
+                1,
+                np.where(
+                    meta[['Anxiety', 'Depression']].isna().any(axis=1),
+                    np.nan,
+                    0
+                )
+            )
+
+            self.df_metadata = meta
+
+
+            # ============================================================
+            # FINAL DATASET
+            # ============================================================
+
+            df_clean = df_scaled.copy()
+
+            df_clean.insert(0, 'ID', df_subset['ID'].values)
+
+            if only_cd:
+                df_clean = df_clean[
+                    pd.to_numeric(df_clean['ID'], errors='coerce') <= 542
+                    ]
+
+            df_clean.to_csv(
+                "/Users/adaml/Desktop/CODE/Data/FemNAT_cleaned_encoded.csv",
+                index=False
+            )
+
+            return df_clean
+
+        except Exception as e:
+            logging.error(f"Preprocessing failed: {e}")
+            raise
+
+    def _plot_histograms(self, data: pd.DataFrame):
+        plt.figure(figsize=(15,10))
+        n = len(data.columns)
+        for i, var in enumerate(data.columns, 1):
+            plt.subplot(2, int(np.ceil(n/2)), i)
+            plt.hist(data[var], bins=20)
+            plt.title(var)
+        plt.tight_layout()
+        plt.savefig('Results/variable_histograms.png')
+        plt.close()
+
+    def _plot_boxplots(self, data: pd.DataFrame):
+        plt.figure(figsize=(15,10))
+        n = len(data.columns)
+        for i, var in enumerate(data.columns, 1):
+            plt.subplot(2, int(np.ceil(n/2)), i)
+            plt.boxplot(data[var])
+            plt.title(var)
+        plt.tight_layout()
+        plt.savefig('Results/variable_boxplots.png')
+        plt.close()
+
+    def _plot_correlation_heatmap(self, data: pd.DataFrame):
+        corr = data.corr()
+        plt.figure(figsize=(12,10))
+        plt.imshow(corr, cmap='viridis', aspect='auto')
+        plt.colorbar()
+        plt.xticks(range(len(data.columns)), data.columns, rotation=45)
+        plt.yticks(range(len(data.columns)), data.columns)
+        plt.tight_layout()
+        plt.savefig('Results/correlation_heatmap.png')
+        plt.close()
+
+    def run_analysis(
+            self,
+            data: pd.DataFrame,
+            breadth: float,
+            depth: float,
+            bootsze: int = 100
+    ) -> Dict[str, Any]:
+
+        self.df_clean = data.copy()
+
+        logging.info(f"Using seed = {self.seed}")
+
+        labels = data['ID'].values
+
+        features = data.drop(
+            columns=['ID'],
+            errors='ignore'
+        )
+
+        # ------------------------------------
+        # Basic plots FIRST
+        # ------------------------------------
+        logging.info("Generating descriptive plots...")
+
+        self._plot_histograms(features)
+
+        self._plot_boxplots(features)
+
+        self._plot_correlation_heatmap(features)
+
+        # ------------------------------------
+        # Train GHSOM
+        # ------------------------------------
+        logging.info("Training GHSOM...")
+
+        struct = self.train_ghsom(
+            features,
+            breadth,
+            depth,
+            labels
+        )
+
+        self.ghsom_struct = struct
+
+        # ------------------------------------
+        # Root clusters
+        # ------------------------------------
+        l1 = self._extract_layer1_clusters(
+            struct,
+            labels
+        )
+
+        self.l1_clusters = l1
+        self.root_clusters = l1
+
+
+
+        # ------------------------------------
+        # Spider plots
+        # ------------------------------------
+        self._plot_spider_profiles_layer1(
+            features,
+            l1
+        )
+
+        # ------------------------------------
+        # Export graph
+        # ------------------------------------
+        self.export_ghsom_to_gexf(
+            struct['root_map'],
+            path='Results/ghsom_root.gexf'
+        )
+
+        # ------------------------------------
+        # Return results
+        # ------------------------------------
+        return {
+            "ghsom_structure": struct,
+            "root_clusters": l1,
+        }
+
+    def plot_umap_clusters(
+            self,
+            data: pd.DataFrame,
+            outpath: str = "Results/UMAP_Root_Clusters.png"
+    ):
+        """
+        UMAP visualization of root SOM clusters.
+        """
+
+        if not hasattr(self, "l1_clusters"):
+            raise RuntimeError("Run run_analysis() first.")
+
+        # -----------------------------------------
+        # Build cluster assignment dataframe
+        # -----------------------------------------
+        rows = []
+
+        for cluster_id, ids in self.l1_clusters.items():
+            for sid in ids:
+                rows.append({
+                    "ID": str(sid),
+                    "Root_Cluster": int(cluster_id)
+                })
+
+        cluster_df = pd.DataFrame(rows)
+
+        # -----------------------------------------
+        # Merge with feature data
+        # -----------------------------------------
+        df = self.df_clean.copy()
+
+        df["ID"] = df["ID"].astype(str)
+
+        df = df.merge(cluster_df, on="ID", how="left")
+
+        # -----------------------------------------
+        # Features
+        # -----------------------------------------
+        X = df.drop(
+            columns=["ID", "Root_Cluster"],
+            errors="ignore"
+        ).values
+
+        y = df["Root_Cluster"].values
+
+        # -----------------------------------------
+        # Run UMAP
+        # -----------------------------------------
+        reducer = umap.UMAP(
+            n_neighbors=15,
+            min_dist=0.2,
+            metric="euclidean",
+            random_state=self.seed
+        )
+
+        embedding = reducer.fit_transform(X)
+
+        # -----------------------------------------
+        # Plot
+        # -----------------------------------------
+        plt.figure(figsize=(8, 7))
+
+        scatter = plt.scatter(
+            embedding[:, 0],
+            embedding[:, 1],
+            c=y,
+            cmap="tab10",
+            s=70,
+            alpha=0.85
+        )
+
+        plt.xlabel("UMAP-1")
+        plt.ylabel("UMAP-2")
+
+        plt.title(
+            "UMAP Projection of Root SOM Clusters",
+            fontsize=14,
+            fontweight="bold"
+        )
+
+        legend = plt.legend(
+            *scatter.legend_elements(),
+            title="Cluster"
+        )
+
+        plt.gca().add_artist(legend)
+
+        plt.tight_layout()
+
+        plt.savefig(
+            outpath,
+            dpi=300,
+            bbox_inches="tight"
+        )
+
+        plt.close()
+
+        logging.info(f"Saved UMAP plot -> {outpath}")
+
+
+
+    def export_ghsom_to_gexf(
+            self,
+            ghsom_root,
+            path: str = "Results/ghsom_force.gexf",
+            layout_scale: float = 1.0
+    ):
+        # 1. Build the directed hierarchy
+        G = nx.DiGraph()
+
+        def traverse(node, name="root", depth=0, group=None):
+            # Group name is the top-level cluster identifier
+            group = name if depth == 1 else group
+            rows, cols = node['topol']['msize']
+            G.add_node(
+                name,
+                label=f"{name} [{rows}×{cols}]",
+                level=depth,
+                parent_group=group or "root"
+            )
+            for idx, child in enumerate(node.get('children', [])):
+
+                if child is None:
+                    continue
+
+                child_name = f"{name}.{idx}"
+
+                rows2, cols2 = child['topol']['msize']
+
+                G.add_node(
+                    child_name,
+                    label=f"{child_name} [{rows2}×{cols2}]",
+                    level=depth + 1,
+                    parent_group=group or "root"
+                )
+
+                G.add_edge(name, child_name)
+                traverse(
+                    child,
+                    child_name,
+                    depth + 1,
+                    group
+                )
+
+
+        positions = nx.spring_layout(G, scale=layout_scale)
+
+        # 3. Write positions into the graph as x,y attributes
+        for node, (x, y) in positions.items():
+            G.nodes[node]['x'] = float(x)
+            G.nodes[node]['y'] = float(y)
+
+        # 4. Export to GEXF
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        nx.write_gexf(G, path)
+        print(f"Exported GHSOM with force-directed layout to {path}")
+
+    def train_ghsom(
+            self,
+            data: pd.DataFrame,
+            breadth: float,
+            depth: float,
+            labels: np.ndarray
+    ) -> Dict[str, Any]:
+
+        import matlab.engine
+        from scipy.io import loadmat
+
+        logging.info("Starting MATLAB (your) ghsom_train...")
+
+        # -------------------------------------------
+        # Start MATLAB
+        # -------------------------------------------
+        eng = matlab.engine.start_matlab()
+
+        # Add toolboxes
+        eng.eval("addpath(genpath('C:/Users/adaml/Desktop/CODE/somtoolbox_1'))", nargout=0)
+        eng.eval("addpath(genpath('C:/Users/adaml/Desktop/CODE/somtoolbox_2'))", nargout=0)
+        eng.eval("addpath(genpath('C:/Users/adaml/Desktop/CODE/MATLAB_GHSOM'))", nargout=0)
+
+        # Set seed
+        eng.eval(f"rng({self.seed});", nargout=0)
+
+        # Push data into MATLAB workspace
+        eng.workspace['X'] = matlab.double(data.astype(float).values.tolist())
+
+        # 🚀 IMPORTANT: assign outputs explicitly inside MATLAB
+        eng.eval(f"""
+        [ghMap, ghTrain] = ghsom_train(X, ...
+            'breadth', {breadth}, ...
+            'depth', {depth}, ...
+            'tracking', 1);
+        """, nargout=0)
+
+        # Now ghMap EXISTS in MATLAB workspace
+        eng.eval("save('Results/ghsom_output.mat','ghMap','ghTrain')", nargout=0)
+
+        eng.quit()
+
+        # -------------------------------------------
+        # Load MATLAB struct
+        # -------------------------------------------
+        mat = loadmat(
+            "Results/ghsom_output.mat",
+            squeeze_me=True,
+            struct_as_record=False
+        )
+
+        ghMap = mat["ghMap"]
+
+        # Convert to Python structure
+        struct = {
+            "root_map": self._convert_matlab_ghmap(ghMap, data.values)
+        }
+
+        self._save_ghsom_results(struct)
+
+        return struct
+
+    def _convert_matlab_ghmap(self, ghMap, X):
+
+
+
+        # -----------------------------
+        # Normalize MATLAB cell arrays
+        # -----------------------------
+        sMap = ghMap.sMap
+        parent = ghMap.parent
+        parent_unit = ghMap.parent_unit
+        layer = ghMap.layer
+
+        # Convert to Python lists if needed
+        if not isinstance(sMap, (list, np.ndarray)):
+            sMap = [sMap]
+        if isinstance(sMap, np.ndarray):
+            sMap = list(sMap.flatten())
+
+        parent = np.array(parent).flatten()
+        parent_unit = np.array(parent_unit).flatten()
+        layer = np.array(layer).flatten()
+
+        # -----------------------------
+        # Root map (MATLAB index 1)
+        # -----------------------------
+        # Find true root
+        root_idx = np.where(parent == 0)[0][0]
+        root_sMap = sMap[root_idx]
+
+        root_codebook = np.array(root_sMap.codebook)
+        n_root_units = np.prod(root_sMap.topol.msize)
+
+        # Compute BMUs
+        d2_root = np.sum((X[:, None, :] - root_codebook[None, :, :]) ** 2, axis=2)
+        root_bmus = np.argmin(d2_root, axis=1)
+
+        # Build children list
+        children = [None] * n_root_units
+
+        for i in range(len(sMap)):
+
+            if i == root_idx:
+                continue
+
+            if layer[i] != 2:
+                continue
+
+            # Must be child of actual root
+            if parent[i] != (root_idx + 1):
+                continue
+
+            root_unit_index = int(parent_unit[i]) - 1
+
+            child_map = sMap[i]
+
+            children[root_unit_index] = {
+                "codebook": np.array(child_map.codebook),
+                "topol": {
+                    "msize": tuple(child_map.topol.msize)
+                }
+            }
+
+        # -----------------------------
+        # Final root structure
+        # -----------------------------
+        root_struct = {
+            "codebook": root_codebook,
+            "bmus": root_bmus,
+            "children": children,
+            "topol": {
+                "msize": tuple(root_sMap.topol.msize)
+            }
+        }
+
+        return root_struct
+
+    def _extract_layer1_clusters(
+            self,
+            struct: Dict[str, Any],
+            labels: np.ndarray
+    ) -> Dict[int, List[str]]:
+
+        clusters = {}
+
+        root_bmus = struct['root_map']['bmus']
+
+        for unit in np.unique(root_bmus):
+            ids = labels[root_bmus == unit]
+            clusters[int(unit)] = ids.tolist()
+
+        return clusters
+
+    def build_root_cluster_clinical_df(self) -> pd.DataFrame:
+
+
+        if not hasattr(self, "l1_clusters"):
+            raise RuntimeError("Run run_analysis() first.")
+
+        rows = []
+        for unit, ids in self.l1_clusters.items():
+            for sid in ids:
+                rows.append({
+                    "ID": sid,
+                    "Root_Cluster": int(unit)
+                })
+
+        df_assign = pd.DataFrame(rows)
+
+        df = (
+            df_assign
+            .merge(self.df_metadata, on="ID", how="left")
+            .merge(self.df_clean, on="ID", how="left")
+        )
+
+        return df
+
+    def compare_root_clusters_categorical(
+            self,
+            df: pd.DataFrame,
+            variable: str
+    ):
+
+
+        table = pd.crosstab(df["Root_Cluster"], df[variable])
+
+        if table.size == 0 or table.to_numpy().sum() == 0:
+            logging.warning(f"No data for categorical variable '{variable}'.")
+            return None
+
+        chi2, p, dof, expected = chi2_contingency(table)
+
+        n = table.to_numpy().sum()
+        k = min(table.shape)
+        cramers_v = np.sqrt(chi2 / (n * (k - 1))) if k > 1 else np.nan
+
+        logging.info(
+            f"[Categorical] {variable}: chi2={chi2:.2f}, p={p:.4f}, "
+            f"Cramér's V={cramers_v:.3f}"
+        )
+
+        return {
+            "variable": variable,
+            "chi2": chi2,
+            "p": p,
+            "cramers_v": cramers_v,
+            "table": table
+        }
+
+    def run_root_cluster_clinical_analysis(
+            self,
+            outpath="Results/Root_Clinical_Stats.xlsx"
+    ):
+
+        if not hasattr(self, "l1_clusters"):
+            raise RuntimeError("Run run_analysis() first")
+
+        rows = []
+        for unit, ids in self.l1_clusters.items():
+            for sid in ids:
+                rows.append({
+                    "ID": sid,
+                    "Root_Cluster": int(unit)
+                })
+
+        df_assign = pd.DataFrame(rows)
+
+        df = (
+            df_assign
+            .merge(self.df_metadata, on="ID", how="left")
+            .merge(self.df_clean, on="ID", how="left")
+        )
+
+        cat_vars = ["ODD", "ADHD", "Depression", "Anxiety", "PTSD", "OCD"]
+        cont_vars = ["CD_total", "Callousness", "Age"]
+
+        diag_rows, cont_rows = [], []
+
+        # CATEGORICAL (same as before)
+        for var in cat_vars:
+            table = pd.crosstab(df["Root_Cluster"], df[var])
+            chi2, p, _, _ = chi2_contingency(table)
+
+            n = table.values.sum()
+            k = min(table.shape)
+            V = np.sqrt(chi2 / (n * (k - 1))) if k > 1 else np.nan
+
+            row = {"Variable": var, "Chi2": chi2, "p": p, "CramersV": V}
+            for cl in table.index:
+                row[f"{cl}_%"] = (
+                        table.loc[cl].get(1, 0) / table.loc[cl].sum() * 100
+                )
+            diag_rows.append(row)
+
+        # CONTINUOUS (same as before)
+        for var in cont_vars:
+            groups = [
+                g.dropna().values
+                for _, g in df.groupby("Root_Cluster")[var]
+                if len(g.dropna()) > 0
+            ]
+
+            if len(groups) < 2:
+                continue
+
+            F, p = f_oneway(*groups)
+
+            all_vals = df[var].dropna().values
+            gm = all_vals.mean()
+            ssb = sum(len(g) * (g.mean() - gm) ** 2 for g in groups)
+            sst = ((all_vals - gm) ** 2).sum()
+            eta2 = ssb / sst if sst > 0 else np.nan
+
+            row = {"Variable": var, "F": F, "p": p, "Eta2": eta2}
+
+            for cl, mean in df.groupby("Root_Cluster")[var].mean().items():
+                row[f"{cl}_Mean"] = mean
+
+            cont_rows.append(row)
+
+        with pd.ExcelWriter(outpath) as w:
+            pd.DataFrame(diag_rows).to_excel(w, sheet_name="Categorical", index=False)
+            pd.DataFrame(cont_rows).to_excel(w, sheet_name="Continuous", index=False)
+
+        logging.info(f"Root clinical analysis written  {outpath}")
+
+    def export_master_dataset(self):
+
+        # =====================================================
+        # BUILD ROOT CLUSTER TABLE
+        # =====================================================
+
+        cluster_rows = []
+
+        for cluster_id, ids in self.l1_clusters.items():
+
+            for sid in ids:
+                cluster_rows.append({
+
+                    "ID": str(sid),
+
+                    "Root_Cluster": int(cluster_id)
+
+                })
+
+        cluster_df = pd.DataFrame(cluster_rows)
+
+        # =====================================================
+        # BASE EXPORT
+        # =====================================================
+
+        export_df = (
+
+            self.df_metadata
+
+            .merge(
+
+                self.df_clean,
+
+                on="ID",
+
+                how="left"
+
+            )
+
+        )
+
+        # =====================================================
+        # LOAD RAW FILE FOR centre / partno
+        # =====================================================
+
+        raw_path = (
+            "/Users/adaml/Desktop/CODE/Data/"
+            "FemNAT_Neuro_psych_main.csv"
+        )
+
+        df_raw = pd.read_csv(raw_path)
+
+        # =====================================================
+        # CLEAN IDS
+        # =====================================================
+
+        export_df["ID"] = (
+            export_df["ID"]
+            .astype(str)
+            .str.strip()
+        )
+
+        cluster_df["ID"] = (
+            cluster_df["ID"]
+            .astype(str)
+            .str.strip()
+        )
+
+        df_raw["ID"] = (
+            df_raw["ID"]
+            .astype(str)
+            .str.strip()
+        )
+
+        # =====================================================
+        # ADD centre + partno
+        # =====================================================
+
+        export_df = export_df.merge(
+
+            df_raw[[
+                "ID",
+                "centre",
+                "partno"
+            ]],
+
+            on="ID",
+
+            how="left"
+
+        )
+
+        # =====================================================
+        # BUILD subjid
+        # =====================================================
+
+        centre_vals = (
+
+            pd.to_numeric(
+                export_df["centre"],
+                errors="coerce"
+            )
+
+            .fillna(0)
+
+            .astype(int)
+
+            .astype(str)
+
+            .str.zfill(2)
+
+        )
+
+        partno_vals = (
+
+            pd.to_numeric(
+                export_df["partno"],
+                errors="coerce"
+            )
+
+            .fillna(0)
+
+            .astype(int)
+
+            .astype(str)
+
+            .str.zfill(4)
+
+        )
+
+        export_df["subjid"] = (
+
+                centre_vals
+
+                + "-"
+
+                + partno_vals
+
+        )
+
+        # =====================================================
+        # MERGE ROOT CLUSTERS
+        # =====================================================
+
+        export_df = export_df.merge(
+
+            cluster_df,
+
+            on="ID",
+
+            how="left"
+
+        )
+
+        # =====================================================
+        # SAVE
+        # =====================================================
+
+        export_df.to_excel(
+
+            "Results/FemNAT_Clinical_Neuropsych.xlsx",
+
+            index=False,
+
+            engine="openpyxl"
+
+        )
+
+        print(
+            "\nSaved master dataset with Root_Cluster labels."
+        )
+
+    def bootstrap_stability(
+            self,
+            data: pd.DataFrame,
+            breadth: float,
+            depth: float,
+            n_boot: int = 10,
+            outpath: str = "Results/GHSOM_Stability.xlsx"
+    ):
+
+        logging.info("Running bootstrap stability analysis...")
+
+        # ---------------------------------------------------------
+        # ORIGINAL MODEL
+        # ---------------------------------------------------------
+        original = self.train_ghsom(
+            data.drop(columns=["ID"], errors="ignore"),
+            breadth,
+            depth,
+            data["ID"].values
+
+        )
+
+        original_labels = original["root_map"]["bmus"]
+
+        # ---------------------------------------------------------
+        # STORAGE
+        # ---------------------------------------------------------
+        ari_rows = []
+        size_rows = []
+        assign_rows = []
+        # ---------------------------------------------------------
+        # BOOTSTRAP LOOP
+        # ---------------------------------------------------------
+        for b in range(n_boot):
+            logging.info(
+                f"Bootstrap {b + 1}/{n_boot}"
+            )
+
+            # -----------------------------------------------------
+            # RESAMPLE PARTICIPANTS
+            # -----------------------------------------------------
+            sample_idx = np.random.choice(
+                len(data),
+                len(data),
+                replace=True
+
+            )
+
+            boot = (
+                data
+                .iloc[sample_idx]
+                .reset_index(drop=True)
+            )
+
+            # -----------------------------------------------------
+            # TRAIN GHSOM
+            # -----------------------------------------------------
+            boot_result = self.train_ghsom(
+
+                boot.drop(
+                    columns=["ID"],
+                    errors="ignore"
+                ),
+
+                breadth,
+                depth,
+                boot["ID"].values
+
+            )
+
+            boot_labels = (
+                boot_result["root_map"]["bmus"]
+            )
+
+            # -----------------------------------------------------
+            # COMPUTE ARI
+            # -----------------------------------------------------
+            ari = adjusted_rand_score(
+                original_labels[sample_idx],
+                boot_labels
+
+            )
+
+            ari_rows.append({
+                "Bootstrap": b + 1,
+                "ARI": ari
+            })
+
+            # -----------------------------------------------------
+            # SAVE CLUSTER SIZES
+            # -----------------------------------------------------
+            unique, counts = np.unique(
+                boot_labels,
+                return_counts=True
+            )
+
+            row = {
+
+                "Bootstrap": b + 1
+            }
+
+            for u, c in zip(unique, counts):
+                row[f"Cluster_{u}_N"] = c
+
+            size_rows.append(row)
+
+            # -----------------------------------------------------
+            # SAVE PARTICIPANT ASSIGNMENTS
+            # -----------------------------------------------------
+            boot_ids = boot["ID"].values
+            for sid, clust in zip(
+                    boot_ids,
+                    boot_labels
+            ):
+                assign_rows.append({
+
+                    "Bootstrap": b + 1,
+                    "ID": sid,
+                    "Cluster": int(clust)
+                })
+
+        # ---------------------------------------------------------
+        # DATAFRAMES
+        # ---------------------------------------------------------
+        ari_df = pd.DataFrame(ari_rows)
+        size_df = pd.DataFrame(size_rows)
+        assign_df = pd.DataFrame(assign_rows)
+
+        # ---------------------------------------------------------
+        # PARTICIPANT STABILITY SUMMARY
+        # ---------------------------------------------------------
+        stability_df = (
+            assign_df
+            .groupby("ID")["Cluster"]
+            .agg([
+                ("N_Clusters", "nunique"),
+                ("Most_Common_Cluster",
+                 lambda x: x.mode()[0])
+            ])
+            .reset_index()
+
+        )
+
+        # participant-level stability
+        participant_stability = (
+            assign_df
+            .groupby("ID")["Cluster"]
+            .agg(lambda x: (x == x.mode()[0]).mean())
+            .reset_index(name="Participant_Stability")
+        )
+
+        # original cluster membership
+        original_cluster_df = pd.DataFrame({
+            "ID": data["ID"].values,
+            "Original_Cluster": original_labels
+        })
+
+        # merge
+        participant_stability = participant_stability.merge(
+            original_cluster_df,
+            on="ID"
+        )
+
+        # average stability per cluster
+        cluster_stability_df = (
+            participant_stability
+            .groupby("Original_Cluster")["Participant_Stability"]
+            .mean()
+            .reset_index(name="Average_Cluster_Stability")
+        )
+
+        # ---------------------------------------------------------
+        # SUMMARY STATS
+        # ---------------------------------------------------------
+        summary_df = pd.DataFrame([{
+
+            "Mean_ARI": ari_df["ARI"].mean(),
+            "SD_ARI": ari_df["ARI"].std(),
+            "Min_ARI": ari_df["ARI"].min(),
+            "Max_ARI": ari_df["ARI"].max()
+
+        }])
+
+        # ---------------------------------------------------------
+        # SAVE HISTOGRAM
+        # ---------------------------------------------------------
+        plt.figure(figsize=(6, 4))
+        plt.hist(
+            ari_df["ARI"],
+            bins=20
+
+        )
+
+        plt.xlabel("ARI")
+        plt.ylabel("Frequency")
+        plt.title("Bootstrap Stability")
+        plt.tight_layout()
+        plt.savefig(
+            "Results/ARI_Distribution.png",
+            dpi=150
+
+        )
+
+        plt.close()
+
+        # ---------------------------------------------------------
+        # EXPORT EXCEL
+        # ---------------------------------------------------------
+
+
+        with pd.ExcelWriter(outpath) as writer:
+            ari_df.to_excel(
+                writer,
+                sheet_name="Bootstrap_ARI",
+                index=False
+
+            )
+
+            summary_df.to_excel(
+                writer,
+                sheet_name="Summary",
+                index=False
+
+            )
+
+            size_df.to_excel(
+                writer,
+                sheet_name="Cluster_Sizes",
+                index=False
+
+            )
+
+            assign_df.to_excel(
+                writer,
+                sheet_name="Assignments",
+                index=False
+
+            )
+
+            stability_df.to_excel(
+                writer,
+                sheet_name="Participant_Stability",
+                index=False
+
+            )
+
+            cluster_stability_df.to_excel(
+                writer,
+                sheet_name="Cluster_Stability",
+                index=False
+            )
+
+        logging.info(
+            f"Stability results written -> {outpath}"
+
+        )
+
+        return {
+
+            "ari_scores": ari_df,
+            "summary": summary_df,
+            "assignments": assign_df,
+            "participant_stability": stability_df,
+            "cluster_stability": cluster_stability_df
+
+        }
+
+    def write_root_cluster_summary(
+            self,
+            outpath="Results/Root_Cluster_Summary.xlsx"
+    ):
+
+        if not hasattr(self, "l1_clusters"):
+            raise RuntimeError("Run run_analysis() first")
+
+        rows = []
+        for unit, ids in self.l1_clusters.items():
+            for sid in ids:
+                rows.append({
+                    "ID": sid,
+                    "Root_Cluster": int(unit)
+                })
+
+        df_assign = pd.DataFrame(rows)
+
+        df = (
+            df_assign
+            .merge(self.df_metadata, on="ID", how="left")
+            .merge(self.df_clean, on="ID", how="left")
+        )
+
+        neuropsych_vars = [
+            c for c in self.df_clean.columns
+            if c not in ["ID", "IQ"]
+        ]
+
+        clinical_vars = [
+            "CD_total", "Callousness", "ODD", "ADHD",
+            "Depression", "Anxiety", "PTSD", "OCD",
+            "Internalising_bin"
+        ]
+
+        summary_rows = []
+
+        for clust, sub in df.groupby("Root_Cluster"):
+
+            row = {"Cluster": clust, "N": len(sub)}
+
+            for var in neuropsych_vars:
+                row[f"Mean_{var}"] = sub[var].mean()
+
+            for var in clinical_vars:
+                if var not in sub.columns:
+                    continue
+
+                if sub[var].dropna().isin([0, 1]).all():
+                    row[f"{var}_%"] = sub[var].mean() * 100
+                else:
+                    row[f"Mean_{var}"] = sub[var].mean()
+
+            row["Mean_Age"] = sub["Age"].mean()
+            row["Mean_IQ"] = sub["IQ"].mean()
+
+            sex_counts = sub["Sex"].value_counts(normalize=True) * 100
+            row["Male_%"] = sex_counts.get(2, 0)
+            row["Female_%"] = sex_counts.get(1, 0)
+
+            summary_rows.append(row)
+
+        summary_df = pd.DataFrame(summary_rows)
+        summary_df.to_excel(outpath, index=False)
+
+        logging.info(f"Root cluster summary written  {outpath}")
+        return summary_df
+
+    def write_layer2_cluster_summary(
+            self,
+            struct,
+            features,
+            outpath="Results/Layer2_Cluster_Summary.xlsx"
+    ):
+
+        labels = self.df_clean["ID"].astype(str).values
+
+        root = struct["root_map"]
+
+        root_bmus = root["bmus"]
+        children = root["children"]
+
+        rows = []
+
+        X = features.values
+
+        # =====================================================
+        # BUILD LAYER-2 ASSIGNMENTS
+        # =====================================================
+
+        for root_unit, child in enumerate(children):
+
+            member_idx = np.where(root_bmus == root_unit)[0]
+
+            if len(member_idx) == 0:
+                continue
+
+            # ---------------------------------------------
+            # No child SOM
+            # ---------------------------------------------
+            if child is None:
+
+                for idx in member_idx:
+                    sid = labels[idx]
+
+                    rows.append({
+                        "ID": sid,
+                        "RootCluster": root_unit,
+                        "Layer2Cluster": np.nan,
+                        "FullCluster": f"{root_unit}"
+                    })
+
+                continue
+
+            # ---------------------------------------------
+            # Child SOM exists
+            # ---------------------------------------------
+            child_cb = child["codebook"]
+
+            Xsub = X[member_idx]
+
+            d2 = np.sum(
+                (Xsub[:, None, :] - child_cb[None, :, :]) ** 2,
+                axis=2
+            )
+
+            child_bmus = np.argmin(d2, axis=1)
+
+            for local_idx, child_unit in enumerate(child_bmus):
+                global_idx = member_idx[local_idx]
+
+                sid = labels[global_idx]
+
+                rows.append({
+                    "ID": sid,
+                    "RootCluster": root_unit,
+                    "Layer2Cluster": int(child_unit),
+                    "FullCluster": f"{root_unit}.{child_unit}"
+                })
+
+        df_assign = pd.DataFrame(rows)
+
+        # =====================================================
+        # MERGE METADATA + FEATURES
+        # =====================================================
+
+        df = (
+            df_assign
+            .merge(self.df_metadata, on="ID", how="left")
+            .merge(self.df_clean, on="ID", how="left")
+        )
+
+        # =====================================================
+        # VARIABLES
+        # =====================================================
+
+        neuropsych_vars = [
+
+            c for c in self.df_clean.columns
+
+            if c not in ["ID", "IQ"]
+
+        ]
+
+        clinical_vars = [
+
+            "CD_total",
+            "Callousness",
+            "ODD",
+            "ADHD",
+            "Depression",
+            "Anxiety",
+            "PTSD",
+            "OCD",
+            "Internalising_bin"
+
+        ]
+
+        summary_rows = []
+
+        # =====================================================
+        # GROUP BY FULLCLUSTER
+        # =====================================================
+
+        for clust, sub in df.groupby("FullCluster"):
+
+            row = {
+
+                "FullCluster": clust,
+
+                "N": len(sub)
+
+            }
+
+            # ---------------------------------------------
+            # Neuropsych means
+            # ---------------------------------------------
+
+            for var in neuropsych_vars:
+                row[f"Mean_{var}"] = sub[var].mean()
+
+            # ---------------------------------------------
+            # Clinical vars
+            # ---------------------------------------------
+
+            for var in clinical_vars:
+
+                if var not in sub.columns:
+                    continue
+
+                if sub[var].dropna().isin([0, 1]).all():
+
+                    row[f"{var}_%"] = (
+                            sub[var].mean() * 100
+                    )
+
+                else:
+
+                    row[f"Mean_{var}"] = sub[var].mean()
+
+            # ---------------------------------------------
+            # Demographics
+            # ---------------------------------------------
+
+            row["Mean_Age"] = sub["Age"].mean()
+
+            row["Mean_IQ"] = sub["IQ"].mean()
+
+            sex_counts = (
+                    sub["Sex"]
+                    .value_counts(normalize=True)
+                    * 100
+            )
+
+            row["Male_%"] = sex_counts.get(2, 0)
+
+            row["Female_%"] = sex_counts.get(1, 0)
+
+            # ---------------------------------------------
+            # Group composition
+            # ---------------------------------------------
+
+            group_counts = (
+                    sub["Group"]
+                    .value_counts(normalize=True)
+                    * 100
+            )
+
+            row["CD_%"] = group_counts.get("CD", 0)
+
+            row["Control_%"] = group_counts.get("Control", 0)
+
+            summary_rows.append(row)
+
+        summary_df = pd.DataFrame(summary_rows)
+
+        # =====================================================
+        # SAVE
+        # =====================================================
+
+        summary_df.to_excel(outpath, index=False)
+
+        print(summary_df)
+
+        logging.info(
+            f"Layer2 cluster summary written -> {outpath}"
+        )
+
+        return summary_df
+
+    def _plot_spider_profiles_layer1(
+            self,
+            features: pd.DataFrame,
+            clusters: Dict[int, List[str]]
+    ):
+
+        import os
+
+        os.makedirs("Results", exist_ok=True)
+
+        print("df_clean ID sample:", self.df_clean['ID'].head().values)
+        print("l1_clusters sample:", {k: v[:3] for k, v in list(clusters.items())[:5]})
+        print("df_clean shape:", self.df_clean.shape)
+
+        # ---------------------------------------------------
+        # Force IDs to strings
+        # ---------------------------------------------------
+        id2idx = {
+            str(id_): i
+            for i, id_ in enumerate(self.df_clean['ID'])
+        }
+
+        cols = features.columns.tolist()
+
+        N = len(cols)
+
+        angles = np.linspace(
+            0,
+            2 * np.pi,
+            N,
+            endpoint=False
+        ).tolist()
+
+        angles += angles[:1]
+
+        # ---------------------------------------------------
+        # Color palette for clusters
+        # ---------------------------------------------------
+        cluster_colors = {
+            0: "#1f77b4",  # blue
+            1: "#ff7f0e",  # orange
+            2: "#2ca02c",  # green
+            3: "#d62728",  # red
+        }
+
+        # ---------------------------------------------------
+        # Loop over clusters
+        # ---------------------------------------------------
+        for unit, ids in clusters.items():
+
+            try:
+
+                idxs = [
+                    id2idx[str(i)]
+                    for i in ids
+                    if str(i) in id2idx
+                ]
+
+                print(
+                    f"Cluster {unit}: "
+                    f"{len(ids)} total, "
+                    f"{len(idxs)} matched in df_clean"
+                )
+
+                if len(idxs) < 2:
+                    print(f"Skipping cluster {unit} (<2 participants)")
+                    continue
+
+                # ---------------------------------------------------
+                # Compute mean profile
+                # ---------------------------------------------------
+                vals = features.iloc[idxs].mean(axis=0).values
+
+                vals = np.nan_to_num(
+                    vals,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0
+                )
+
+                vals = vals.tolist()
+                vals += vals[:1]
+
+                # ---------------------------------------------------
+                # Cluster display name (1-4 instead of 0-3)
+                # ---------------------------------------------------
+                display_cluster = unit + 1
+
+                # ---------------------------------------------------
+                # Cluster color
+                # ---------------------------------------------------
+                color = cluster_colors.get(unit, "#333333")
+
+                # ---------------------------------------------------
+                # Plot
+                # ---------------------------------------------------
+                fig, ax = plt.subplots(
+                    figsize=(8, 8),
+                    subplot_kw={'polar': True}
+                )
+
+                ax.plot(
+                    angles,
+                    vals,
+                    linewidth=3,
+                    color=color,
+                    label=f"Cluster {display_cluster}"
+                )
+
+                ax.fill(
+                    angles,
+                    vals,
+                    color=color,
+                    alpha=0.25
+                )
+
+                # ---------------------------------------------------
+                # Cleaner feature labels
+                # ---------------------------------------------------
+                pretty_cols = [
+                    c.replace("_", " ").title()
+                    for c in cols
+                ]
+
+                ax.set_thetagrids(
+                    np.degrees(angles[:-1]),
+                    pretty_cols,
+                    fontsize=10
+                )
+
+                # Improve spacing of labels
+                ax.tick_params(axis='x', pad=12)
+
+                # Radial axis formatting
+                ax.set_ylim(-2, 3)
+
+                ax.set_yticks([-2, -1, 0, 1, 2, 3])
+
+                ax.set_yticklabels(
+                    ['-2', '-1', '0', '1', '2', '3'],
+                    fontsize=9
+                )
+
+                # Grid styling
+                ax.grid(
+                    True,
+                    linestyle='--',
+                    alpha=0.5
+                )
+
+                # Title
+                ax.set_title(
+                    f"Root Cluster {display_cluster}",
+                    fontsize=16,
+                    fontweight='bold',
+                    y=1.12
+                )
+
+                # Optional legend
+                ax.legend(
+                    loc='upper right',
+                    bbox_to_anchor=(1.2, 1.1)
+                )
+
+                outfile = f"Results/spider_L1_cluster_{display_cluster}.png"
+
+                print(f"Saving spider plot -> {outfile}")
+
+                plt.savefig(
+                    outfile,
+                    bbox_inches="tight",
+                    dpi=300
+                )
+
+                plt.close()
+
+                print(f"Saved: {outfile}")
+
+            except Exception as e:
+
+                print(
+                    f"Spider plot failed for cluster "
+                    f"{unit}: {e}"
+                )
+
+    def _save_ghsom_results(self, struct: Dict[str, Any]):
+        np.savetxt('Layer2/NWT_V1.csv', struct['root_map']['codebook'], delimiter=',')
+        np.savetxt('Layer2/DPP_V1.csv', np.ones(len(struct['root_map']['codebook'])), delimiter=',')
+        np.save('Results/GHSOM_Struct.npy', struct)
+
+
+def main():
+
+    analysis = SOMAnalysis()
+
+    scaled = analysis.preprocess_data(
+        only_cd=True,
+        site_normalization=True
+    )
+
+    breadth = 0.9
+    depth = 1
+
+    # ------------------------------------
+    # Run GHSOM
+    # ------------------------------------
+    results = analysis.run_analysis(
+        data=scaled,
+        breadth=breadth,
+        depth=depth,
+        bootsze=100
+    )
+    analysis.export_master_dataset()
+
+    analysis.bootstrap_stability(
+        data=scaled,
+        breadth=breadth,
+        depth=depth,
+        n_boot=10
+    )
+
+    print("RESULTS TYPE:", type(results))
+
+    if results is None:
+        raise RuntimeError("run_analysis returned None")
+
+    # ------------------------------------
+    # Clinical analyses
+    # ------------------------------------
+    analysis.run_root_cluster_clinical_analysis()
+
+    analysis.write_root_cluster_summary()
+
+    analysis.write_layer2_cluster_summary(
+        struct=results["ghsom_structure"],
+        features=scaled.drop(
+            columns=["ID"],
+            errors='ignore'
+        )
+    )
+
+    print("\nAnalysis complete.")
+
+    analysis.plot_umap_clusters(scaled)
+
+if __name__ == "__main__":
+    main()
